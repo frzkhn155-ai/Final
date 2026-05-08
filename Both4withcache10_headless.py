@@ -299,10 +299,10 @@ FII_DII_SCORE_UNUSUAL        = +2     # sudden reversal — high conviction move
 
 # ORB STRATEGY CONFIGURATION
 ENABLE_ORB_STRATEGY = True
-ORB_TIMEFRAME_MINUTES = 5  # First 5 minutes (9:15-9:20)
+ORB_TIMEFRAME_MINUTES = 15  # First 15 minutes (9:15-9:30)
 ORB_MIN_CANDLE_BODY_PERCENT = 0.5  # Minimum 0.5% body size
 ORB_VOLUME_CONFIRMATION = 1.5  # Raised: 1.5x average volume required (was 1.2x)
-ORB_BREAKOUT_WINDOW_MINUTES = 30  # Tightened: only trade within 30 min of 9:20 (was 60)
+ORB_BREAKOUT_WINDOW_MINUTES = 60  # Trade within 60 min of 9:30 (until 10:30)
 ORB_TARGET_MULTIPLIER = 2.0  # Target = 2x candle body
 ORB_STOP_MULTIPLIER = 1.0  # Stop at opposite end of candle
 ORB_MIN_VOLUME = 500000  # Minimum average volume
@@ -444,7 +444,7 @@ FII_DII_TREND_LOCK                = threading.RLock()  # Thread safety
 # ORB GLOBALS
 ORB_CANDLES = {}
 ORB_SIGNALS = {}
-ORB_LATE_CHECKED = set()   # symbols confirmed zero-volume at 09:20; retry until volume appears
+ORB_LATE_CHECKED = set()   # symbols confirmed zero-volume at 09:30; retry until volume appears
 ORB_ACTIVE_TRADES = {}
 ORB_ALERTED_STOCKS = set()   # fired ORB signal today
 ORB_ORDER_COUNT = 0
@@ -3195,12 +3195,12 @@ def calculate_orb_levels(symbol, open_price, close_price, high_price, low_price,
 
 def process_first_candles(access_token, live_data, late_pass=False):
     """
-    Build ORB signals from the first 5-minute candle.
+    Build ORB signals from the first 15-minute candle.
 
     Called in two modes:
-      1. Primary pass (late_pass=False) at 09:20–09:25 — processes all stocks.
+      1. Primary pass (late_pass=False) at 09:30–09:35 — processes all stocks.
          Symbols with zero volume are added to ORB_LATE_CHECKED for retry.
-      2. Late pass (late_pass=True) at 09:25 until the breakout window closes —
+      2. Late pass (late_pass=True) at 09:35 until the breakout window closes —
          only retries symbols in ORB_LATE_CHECKED that still lack a signal and
          now have volume.  Once a symbol gets a signal (or volume stays zero all
          the way to the window close) it is removed from ORB_LATE_CHECKED.
@@ -3208,14 +3208,14 @@ def process_first_candles(access_token, live_data, late_pass=False):
     global ORB_SIGNALS, ORB_PROCESSED_TODAY, ORB_LATE_CHECKED
     if not late_pass:
         print(f"\n{'='*100}")
-        print("📊 PROCESSING FIRST 5-MINUTE CANDLES FOR ORB STRATEGY")
+        print("📊 PROCESSING FIRST 15-MINUTE CANDLES FOR ORB STRATEGY")
         print(f"{'='*100}\n")
         ORB_LATE_CHECKED.clear()          # fresh slate each trading day
     else:
         if not ORB_LATE_CHECKED:
             return                        # nothing left to retry — skip immediately
         print(f"\n🔄 ORB late-volume pass ({datetime.now().strftime('%H:%M')}) — "
-              f"retrying {len(ORB_LATE_CHECKED)} zero-volume symbols from 09:20")
+              f"retrying {len(ORB_LATE_CHECKED)} zero-volume symbols from 09:30")
 
     orb_count = 0
     very_high = 0
@@ -3286,9 +3286,9 @@ def check_orb_breakout(symbol, current_price, current_volume, live_data):
         return None
     orb = ORB_SIGNALS[symbol]
     now = datetime.now()
-    market_open_920 = now.replace(hour=9, minute=20, second=0, microsecond=0)
-    minutes_since_920 = (now - market_open_920).total_seconds() / 60
-    if minutes_since_920 < 0 or minutes_since_920 > ORB_BREAKOUT_WINDOW_MINUTES:
+    market_open_930 = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    minutes_since_930 = (now - market_open_930).total_seconds() / 60
+    if minutes_since_930 < 0 or minutes_since_930 > ORB_BREAKOUT_WINDOW_MINUTES:
         return None
 
     # ── Volume check: use VOLUME_DATA OR live_data avg_volume ───────────────
@@ -3510,22 +3510,22 @@ def check_orb_time_and_process(access_token, live_data):
         return
     now          = datetime.now()
     current_time = now.strftime("%H:%M")
-    market_920   = now.replace(hour=9, minute=20, second=0, microsecond=0)
-    cutoff       = market_920 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
+    market_930   = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    cutoff       = market_930 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
 
     if current_time < "09:15":
         ORB_PROCESSED_TODAY = False
         ORB_LATE_CHECKED.clear()
 
     # ── PRIMARY PASS ─────────────────────────────────────────────────────────
-    # Old: only ran 09:20-09:25. Bot starting at 09:26 silently skipped ORB.
-    # New: run primary pass any time between 09:20 and breakout window close,
+    # Old: only ran 09:30-09:35. Bot starting at 09:36 silently skipped ORB.
+    # New: run primary pass any time between 09:30 and breakout window close,
     # as long as it hasn't run yet today. One-shot — process_first_candles
     # sets ORB_PROCESSED_TODAY=True so it never fires twice.
-    if current_time >= "09:20" and now < cutoff and not ORB_PROCESSED_TODAY:
-        if current_time >= "09:25":
+    if current_time >= "09:30" and now < cutoff and not ORB_PROCESSED_TODAY:
+        if current_time >= "09:35":
             print(f"\n⚠️  ORB: Late start detected ({current_time}). "
-                  f"Running primary ORB pass now — {int((now - market_920).total_seconds() / 60)}min "
+                  f"Running primary ORB pass now — {int((now - market_930).total_seconds() / 60)}min "
                   f"into session. Signals use current candle data.")
         process_first_candles(access_token, live_data, late_pass=False)
 
@@ -3533,7 +3533,7 @@ def check_orb_time_and_process(access_token, live_data):
     # Retry zero-volume symbols from the primary pass until the window closes.
     elif (ORB_PROCESSED_TODAY
           and ORB_LATE_CHECKED
-          and current_time >= "09:25"
+          and current_time >= "09:35"
           and now < cutoff):
         process_first_candles(access_token, live_data, late_pass=True)
 
@@ -9151,12 +9151,12 @@ def enhanced_monitor(access_token, keys, symbols):
             # process anything useful without live prices). We just prime the
             # state so scan #1 doesn't need to re-trigger the primary pass.
             _now = datetime.now()
-            _920 = _now.replace(hour=9, minute=20, second=0, microsecond=0)
-            _cutoff = _920 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
+            _930 = _now.replace(hour=9, minute=30, second=0, microsecond=0)
+            _cutoff = _930 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
             _ct = _now.strftime("%H:%M")
-            if ENABLE_ORB_STRATEGY and _ct >= "09:20" and _now < _cutoff and not ORB_PROCESSED_TODAY:
+            if ENABLE_ORB_STRATEGY and _ct >= "09:30" and _now < _cutoff and not ORB_PROCESSED_TODAY:
                 print(f"\n🕘 ORB startup: bot started at {_ct}, within ORB window "
-                      f"(09:20–{_cutoff.strftime('%H:%M')}). "
+                      f"(09:30–{_cutoff.strftime('%H:%M')}). "
                       f"Will run primary ORB pass on first live-data scan.")
             # ── END ORB STARTUP CATCHUP ──────────────────────────────────────
         
