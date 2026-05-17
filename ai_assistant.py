@@ -88,6 +88,7 @@ def analyze_orb_signal(orb_signal, market_data=None):
     fii_dii = orb_signal.get('fii_dii_signal', 'NEUTRAL')
     rsi = orb_signal.get('rsi_at_signal')
     klinger = orb_signal.get('klinger_at_signal')
+    klinger_str = f"{klinger/1e6:.2f}M" if klinger else 'N/A'
     
     # Build analysis prompt
     prompt = f"""Analyze this ORB (Opening Range Breakout) trading signal:
@@ -99,7 +100,7 @@ RISK:REWARD: {rr_ratio:.2f}:1
 CANDLE BODY: {body_pct:.2f}%
 FII/DII: {fii_dii}
 RSI: {rsi if rsi else 'N/A'}
-KLINGER: {klinger/1e6:.2f}M" if klinger else 'N/A'}
+KLINGER: {klinger_str}
 
 Provide:
 1. Signal Quality (1-10): 
