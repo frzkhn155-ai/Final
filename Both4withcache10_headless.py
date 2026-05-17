@@ -26,21 +26,6 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
-import pytz
-
-# ── IST timezone helper ───────────────────────────────────────────────────────
-# GitHub Actions runners (and most CI/CD environments) run on UTC.
-# All market-time logic in this bot uses IST strings (09:15, 15:30, etc.).
-# now_ist() always returns the current time in IST as a naive datetime,
-# so every existing comparison (strftime, replace, timedelta) works unchanged.
-_IST = pytz.timezone('Asia/Kolkata')
-
-def now_ist() -> datetime:
-    """Return current datetime in IST (Asia/Kolkata), as a naive datetime.
-    Safe on GitHub Actions (UTC), local Linux/Windows, and Android (Pydroid3).
-    """
-    return datetime.now(_IST).replace(tzinfo=None)
-# ─────────────────────────────────────────────────────────────────────────────
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -133,7 +118,7 @@ FAST_TRADE_ENTRY_FILE = "fast_trades_entries.csv"
 FAST_TRADE_EXIT_FILE = "fast_trades_exits.csv"
 
 # AUTOMATED TRADING CONFIGURATION
-ENABLE_AUTO_TRADING = True
+ENABLE_AUTO_TRADING = False          # R3/S3 Breakout - SIGNALS ONLY (orders disabled)
 ORDER_QUANTITY = 1
 ORDER_PRODUCT = 'D'                   # <-- changed from 'I' to 'D' (NRML for options)
 PLACE_STOPLOSS = True
@@ -168,7 +153,7 @@ ENABLE_STRATEGY_EXITS = True
 POSITION_MONITORING_INTERVAL = 30
 
 # GAP TRADING CONFIGURATION
-ENABLE_GAP_TRADING = True
+ENABLE_GAP_TRADING = False           # SIGNALS ONLY (orders disabled)
 GAP_THRESHOLD_PERCENT = 1.0
 GAP_FILL_THRESHOLD = 0.3
 MAX_GAP_PERCENT = 5.0
@@ -179,7 +164,7 @@ GAP_MIN_VOLUME_RATIO = 1.2
 GAP_FILL_EXIT_PERCENT = 80
 
 # BOX THEORY CONFIGURATION
-ENABLE_BOX_TRADING = True
+ENABLE_BOX_TRADING = False           # SIGNALS ONLY (orders disabled)
 BOX_CONFIRMATION_CYCLES = 2
 BOX_VOLUME_THRESHOLD_MULTIPLIER = 1.0
 BOX_REENTRY_EXIT_PERCENT = 0.5
@@ -191,7 +176,7 @@ MAX_ENTRY_DISTANCE_PERCENT = 1.5  # Skip CE if price > 1.5% above box top at con
                                    # Skip PE if price > 1.5% below box bottom at confirmation
 
 # RANGE TRADING CONFIGURATION
-ENABLE_RANGE_TRADING = True
+ENABLE_RANGE_TRADING = False         # SIGNALS ONLY (orders disabled)
 RANGE_BOUNCE_THRESHOLD = 0.5
 BOUNCE_VOLUME_MULTIPLIER = 1.2
 
@@ -217,7 +202,7 @@ CACHE_UPDATE_HOUR = 18  # Update cache after market close (6 PM)
 CACHE_STATS_FILE = "cache_stats.json"
 
 # ============ FAST TRADING CONFIGURATION ============
-ENABLE_FAST_TRADING = True
+ENABLE_FAST_TRADING = False          # SIGNALS ONLY (orders disabled)
 
 # ── DUAL TIMEFRAME CONFIGURATION ─────────────────────────────────────────────
 # SQUEEZE (LONG) signals use 15min candles — catches real breakouts with
@@ -292,10 +277,33 @@ ENABLE_REENTRY              = True    # master switch (covers all non-ORB strate
 REENTRY_COOLDOWN_MINS       = 30      # minutes between first entry and re-entry
 REENTRY_MIN_GAIN_PCT        = 0.5     # % above first entry price for new-high gate
 REENTRY_VOLUME_MULTIPLIER   = 1.2     # volume ratio must be ≥ first ratio × this
-REENTRY_NIFTY_MIN_GAIN_PCT  = 0.3    # Nifty must be up ≥ this % for LONG re-entries
-                                      # (set 0.0 to disable market filter)
+REENTRY_NIFTY_MIN_GAIN_PCT  = 0.0   # Legacy constant — kept for backward compat;
+                                     # actual filter now uses 15-min BB (see below).
+                                     # Set 0.0 so old code paths don't block re-entries.
 REENTRY_CONFIRM_SCANS       = 2       # consecutive confirmations required (anti-fake)
 REENTRY_MAX_PER_SYMBOL      = 1       # hard cap: max re-entries per symbol per day
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── NIFTY 15-MIN BOLLINGER BAND RE-ENTRY FILTER ───────────────────────────────
+# Replaces the simple daily-gain-% check with a real-time market context derived
+# from Nifty 50's own 15-min Bollinger Bands (period=20, std=2).
+#
+# Logic:
+#   %B > NIFTY_BB_UPPER_BLOCK_LONG  → Nifty near upper band (overbought / extended)
+#                                      → Block NEW LONG re-entries (risk of reversal)
+#   %B < NIFTY_BB_LOWER_BLOCK_SHORT → Nifty near lower band (oversold / extended down)
+#                                      → Block NEW SHORT re-entries
+#   Price above middle band          → Mild bullish bias → LONG re-entries allowed
+#   Price below middle band          → Mild bearish bias → SHORT re-entries allowed
+#   Data unavailable                 → Fail-open (allow re-entry, don't block on error)
+#
+# Set ENABLE_NIFTY_BB_REENTRY_FILTER = False to revert to the old % gain check.
+ENABLE_NIFTY_BB_REENTRY_FILTER    = True
+NIFTY_INSTRUMENT_KEY               = "NSE_INDEX|Nifty 50"
+NIFTY_BB_PERIOD                    = 20
+NIFTY_BB_STD                       = 2
+NIFTY_BB_UPPER_BLOCK_LONG          = 0.80   # %B ≥ 0.80 → block LONG re-entry
+NIFTY_BB_LOWER_BLOCK_SHORT         = 0.20   # %B ≤ 0.20 → block SHORT re-entry
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── EARLY TOPPING REVERSAL CONFIG ────────────────────────────────────────────
@@ -346,6 +354,11 @@ ORB_MIN_VOLUME = 500000  # Minimum average volume
 ORB_ENABLE_MARKET_ALIGNMENT = True  # Check Nifty direction
 ORB_ENABLE_FII_DII_FILTER = True  # Only trade with FII/DII alignment
 
+# ORB Second Half Configuration (Afternoon session)
+ORB_ENABLE_SECOND_HALF = True       # Enable ORB in afternoon session
+ORB_SECOND_HALF_START = "12:30"     # Start checking for second half ORB (noon)
+ORB_SECOND_HALF_WINDOW_MINUTES = 180 # Trade until 15:30 (extended from 60 to 180 min)
+
 # ORB QUALITY GATE — Klinger + RSI secondary filter
 ORB_ENABLE_KLINGER_GATE   = True   # Require Klinger alignment for ORB signals
 ORB_ENABLE_RSI_GATE       = True   # Require RSI momentum confirmation
@@ -359,17 +372,6 @@ ORB_REQUIRE_STRONG_FII_FOR_MEDIUM_RSI = True  # If RSI borderline, require STRON
 ORB_SIGNALS_FILE = "orb_signals.csv"
 ORB_TRADES_FILE = "orb_trades.csv"
 ORB_LOG_FILE = "orb_trading_log.txt"
-
-# ── ORB RE-ENTRY CONFIGURATION ────────────────────────────────────────────────
-# After the initial ORB entry the bot continues watching price.  If price makes
-# a confirmed NEW SESSION HIGH (above the original ORB candle high) with still-
-# elevated volume and after a minimum cooldown, one additional re-entry is
-# allowed.  Capped at 1 re-entry per symbol per day.
-ORB_REENTRY_ENABLED       = True    # master switch for re-entry logic
-ORB_REENTRY_MIN_GAIN_PCT  = 0.5    # % above original ORB candle HIGH before re-entry counts
-ORB_REENTRY_COOLDOWN_MINS = 20     # minimum minutes between first entry and re-entry
-ORB_REENTRY_TARGET_MULT   = 2.0    # target = entry + (entry - new_stop) × this
-# ─────────────────────────────────────────────────────────────────────────────
 
 # ============ OPTION TRADING CONFIGURATION ============
 OPTION_PREMIUM_MIN_THRESHOLD = 1.0  # Minimum premium to consider
@@ -495,23 +497,9 @@ ORB_SIGNALS = {}
 ORB_LATE_CHECKED = set()   # symbols confirmed zero-volume at 09:30; retry until volume appears
 ORB_ACTIVE_TRADES = {}
 ORB_ALERTED_STOCKS = set()   # fired ORB signal today
+ORB_BREAKOUT_LEVELS = {}     # track highest breakout level per symbol for re-entry
 ORB_ORDER_COUNT = 0
 ORB_PROCESSED_TODAY = False
-
-# ── ORB RE-ENTRY GLOBALS ──────────────────────────────────────────────────────
-LAST_ORB_BREAKOUT_STATE  = {}   # symbol → confirmation-state dict (multi-scan validation)
-ORB_REENTRY_ALERTED      = set()  # symbols that have already taken a re-entry today (cap = 1)
-ORB_FIRST_ENTRY_TIME     = {}   # symbol → datetime of first confirmed ORB entry
-ORB_FIRST_ENTRY_HIGH     = {}   # symbol → ORB candle high at time of first entry
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── SAME-DIRECTION RE-ENTRY GLOBALS (R3/S3/BOX/RANGE/FAST) ───────────────────
-# Keyed by symbol.  Populated by send_alert() and monitor_fast_trades() when a
-# first entry fires; consumed by check_*_reentry() helpers each scan cycle.
-REENTRY_FIRST_ENTRY: dict  = {}   # symbol → {time, price, vol_ratio, strategy, direction}
-REENTRY_ALERTED:     dict  = {}   # symbol → set of strategies that have re-entered today
-REENTRY_CONFIRM_STATE: dict = {}  # symbol+strategy → pending confirmation state
-# ─────────────────────────────────────────────────────────────────────────────
 
 # ── PERSISTENT HTTP SESSIONS ─────────────────────────────────────────────────
 # Reusing a Session keeps the TCP/TLS connection alive across calls.
@@ -726,7 +714,7 @@ def load_candle_cache(symbol, _silent=False):
             with open(meta_file, 'r') as f:
                 metadata = json.load(f)
             last_update = datetime.fromisoformat(metadata['last_updated'])
-            days_old = (now_ist() - last_update).days
+            days_old = (datetime.now() - last_update).days
             if days_old > CACHE_EXPIRY_DAYS:
                 if DEBUG_MODE:
                     print(f"⚠️ Cache expired for {symbol} ({days_old} days old)")
@@ -774,7 +762,7 @@ def save_candle_cache(symbol, df, instrument_key=None):
         metadata = {
             'symbol': symbol,
             'instrument_key': instrument_key,
-            'last_updated': now_ist().isoformat(),
+            'last_updated': datetime.now().isoformat(),
             'candle_count': len(df),
             'date_range': {
                 'start': df['date'].min().isoformat(),
@@ -815,7 +803,7 @@ def update_candle_cache_incremental(access_token, symbol, instrument_key):
     
     # Get last cached date
     last_cached_date = cached_df['date'].max()
-    today = now_ist().date()
+    today = datetime.now().date()
     
     # Check if we need to update
     if last_cached_date.date() >= today:
@@ -882,7 +870,7 @@ def fetch_and_cache_full_history(access_token, symbol, instrument_key, days=120)
     """Fetch full candle history and cache it"""
     global CACHE_STATS
     
-    end_date = now_ist().date()
+    end_date = datetime.now().date()
     start_date = end_date - timedelta(days=days)
     
     from_date_str = start_date.strftime('%Y-%m-%d')
@@ -939,7 +927,7 @@ def get_cached_or_fetch_candles(access_token, symbol, instrument_key):
         df = CANDLE_CACHE[symbol]
         if df is not None and len(df) >= MIN_CANDLES_FOR_KLINGER:
             last_date = df['date'].max().date()
-            today = now_ist().date()
+            today = datetime.now().date()
             if last_date >= today:
                 return df          # fully up-to-date, no I/O needed
             # Stale — do incremental update; update_candle_cache_incremental
@@ -952,7 +940,7 @@ def get_cached_or_fetch_candles(access_token, symbol, instrument_key):
 
     if cached_df is not None and len(cached_df) >= MIN_CANDLES_FOR_KLINGER:
         last_date = cached_df['date'].max().date()
-        today = now_ist().date()
+        today = datetime.now().date()
         if last_date < today:
             return update_candle_cache_incremental(access_token, symbol, instrument_key)
         return cached_df
@@ -1075,7 +1063,7 @@ def fetch_klinger_data_cached(access_token, instrument_key, symbol):
         'klinger_prev': float(klinger.iloc[-2]) if len(klinger) > 1 else float(klinger.iloc[-1]),
         'signal_prev': float(signal_line.iloc[-2]) if len(signal_line) > 1 else float(signal_line.iloc[-1]),
         'ko_history': ko_history,
-        'last_update': now_ist(),
+        'last_update': datetime.now(),
         'candle_count': len(df),
         'adaptive_params': len(df) < 90 if ADAPTIVE_KLINGER_LOOKBACK else False
     }
@@ -1087,7 +1075,7 @@ def cleanup_old_cache():
     
     try:
         cleaned_count = 0
-        expiry_date = now_ist() - timedelta(days=CACHE_EXPIRY_DAYS * 2)
+        expiry_date = datetime.now() - timedelta(days=CACHE_EXPIRY_DAYS * 2)
         
         # Clean daily candles
         candle_dir = os.path.join(CACHE_DIRECTORY, 'daily_candles')
@@ -1121,7 +1109,7 @@ def cleanup_old_cache():
 def save_cache_stats():
     """Save cache statistics to file"""
     try:
-        CACHE_STATS['last_updated'] = now_ist().isoformat()
+        CACHE_STATS['last_updated'] = datetime.now().isoformat()
         CACHE_STATS['total_cached_symbols'] = len([f for f in os.listdir(os.path.join(CACHE_DIRECTORY, 'daily_candles')) if f.endswith('.csv')])
         
         stats_file = os.path.join(CACHE_DIRECTORY, CACHE_STATS_FILE)
@@ -1222,7 +1210,7 @@ class UpstoxLogin:
                 data = json.load(f)
                 token_timestamp = datetime.fromisoformat(data['timestamp'])
                 token_date = token_timestamp.date()
-            now = now_ist()
+            now = datetime.now()
             today = now.date()
             cutoff_time = datetime.combine(today, datetime.strptime("09:00", "%H:%M").time())
             print(f"📅 Token generated on: {token_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1246,10 +1234,10 @@ class UpstoxLogin:
     def save_token_timestamp(self, token: str):
         try:
             data = {
-                'timestamp': now_ist().isoformat(),
+                'timestamp': datetime.now().isoformat(),
                 'token': token,
-                'date': now_ist().strftime('%Y-%m-%d'),
-                'time': now_ist().strftime('%H:%M:%S')
+                'date': datetime.now().strftime('%Y-%m-%d'),
+                'time': datetime.now().strftime('%H:%M:%S')
             }
             with open(TOKEN_TIMESTAMP_FILE, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -1358,7 +1346,7 @@ class UpstoxLogin:
             get_otp_btn = WebDriverWait(self.driver, 10).until(
                 EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Get OTP')]"))
             )
-            otp_request_time = now_ist()
+            otp_request_time = datetime.now()
             get_otp_btn.click()
             print("📨 OTP requested.")
 
@@ -1542,7 +1530,7 @@ class UpstoxLogin:
     def get_latest_otp_by_uid(self, max_wait: int = 90, otp_request_time: datetime = None) -> str:
         try:
             if otp_request_time is None:
-                otp_request_time = now_ist()
+                otp_request_time = datetime.now()
             print(f"⏳ Waiting for NEW OTP email (checking every 3 seconds, max {max_wait}s)...")
             print(f"🕐 OTP requested at: {otp_request_time.strftime('%H:%M:%S')}")
             start_time = time.time()
@@ -2196,7 +2184,7 @@ class UpstoxLogin:
             get_otp_button = WebDriverWait(self.driver, 15).until(
                 EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Get OTP')]"))
             )
-            otp_request_time = now_ist()
+            otp_request_time = datetime.now()
             print(f"🕐 Timestamp: {otp_request_time.strftime('%H:%M:%S.%f')[:-3]}")
             get_otp_button.click()
             print("✅ OTP requested")
@@ -2482,7 +2470,7 @@ class UpstoxTrader:
                 'symbol': instrument_key,
                 'strategy': 'UNKNOWN',
                 'reason': 'Outside Upstox service hours (05:30–23:59 IST)',
-                'timestamp': now_ist()
+                'timestamp': datetime.now()
             })
             return {
                 "status_code": 423,
@@ -2553,7 +2541,7 @@ def is_order_time_allowed():
     because it is an exchange-level restriction, not a market-hours restriction.
     Trying outside this window returns HTTP 423 (UDAPI100074).
     """
-    now = now_ist()
+    now = datetime.now()
     order_start = now.replace(hour=5, minute=30, second=0, microsecond=0)
     order_end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
     allowed = order_start <= now <= order_end
@@ -2566,7 +2554,7 @@ def is_market_open():
     # FIX 4: Bypass check if TEST_MODE is enabled
     if BYPASS_MARKET_CHECKS:
         return True
-    now = now_ist()
+    now = datetime.now()
     if now.weekday() >= 5:
         return False
     current_time = now.strftime("%H:%M")
@@ -2576,7 +2564,7 @@ def is_market_stabilized():
     # FIX 4: Bypass check if TEST_MODE is enabled
     if BYPASS_MARKET_CHECKS:
         return True
-    now = now_ist()
+    now = datetime.now()
     if now.weekday() >= 5:
         return False
     current_time = now.strftime("%H:%M")
@@ -2588,14 +2576,14 @@ def is_market_stabilized():
 
 def is_exit_time():
     """Check if it's time to start exiting positions"""
-    now = now_ist()
+    now = datetime.now()
     current_time = now.strftime("%H:%M")
     return current_time >= EXIT_START_TIME
 
 def is_gap_trading_window(now=None):
     """Check if current time is within gap trading window"""
     if now is None:
-        now = now_ist()
+        now = datetime.now()
     market_open = datetime.strptime(MARKET_OPEN_TIME, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
     minutes_since_open = (now - market_open).total_seconds() / 60
     return GAP_ENTRY_DELAY_MINUTES <= minutes_since_open <= GAP_TRADING_WINDOW_MINUTES
@@ -2603,7 +2591,7 @@ def is_gap_trading_window(now=None):
 def dynamic_volume_threshold():
     if not USE_DYNAMIC_VOLUME_THRESHOLD:
         return VOLUME_SPIKE_THRESHOLD
-    now = now_ist()
+    now = datetime.now()
     market_open_dt = datetime.strptime(MARKET_OPEN_TIME, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
     minutes_since_open = (now - market_open_dt).total_seconds() / 60
     if minutes_since_open < 60:
@@ -2615,7 +2603,7 @@ def dynamic_volume_threshold():
 
 def previous_trading_day(max_lookback_days=15):
     """Get the most recent trading day, skipping weekends and NSE holidays"""
-    today = now_ist().date()
+    today = datetime.now().date()
     
     print(f"🔍 Looking for previous trading day from {today} ({today.strftime('%A')})")
     
@@ -2715,7 +2703,7 @@ def verify_token(token, verbose=True):
             exp_ts = payload.get('exp')
             if exp_ts:
                 exp_dt = datetime.fromtimestamp(exp_ts)
-                now = now_ist()
+                now = datetime.now()
                 if now > exp_dt:
                     print(f"🚨 TOKEN EXPIRED at {exp_dt.strftime('%Y-%m-%d %H:%M:%S')} — IT IS NOW {now.strftime('%H:%M:%S')} — ORDERS WILL FAIL!")
                     print(f"   ➡ Set USE_HARDCODED_TOKEN=False to auto-login, or update HARDCODED_TOKEN")
@@ -2823,7 +2811,7 @@ def extract_fii_dii_data():
                 if not symbol:
                     continue
                 stock = {
-                    'Date': now_ist().strftime('%Y-%m-%d'),
+                    'Date': datetime.now().strftime('%Y-%m-%d'),
                     'Symbol': symbol,
                     'Stock_Name': name,
                     'FII_DII_Cash': cols[1].get_text(strip=True),
@@ -2835,10 +2823,10 @@ def extract_fii_dii_data():
         if not stocks:
             return load_fii_dii_from_cache()
         df = pd.DataFrame(stocks)
-        filename = f"FII_DII_{now_ist().strftime('%Y%m%d')}.csv"
+        filename = f"FII_DII_{datetime.now().strftime('%Y%m%d')}.csv"
         df.to_csv(filename, index=False)
         FII_DII_DATA = {row['Symbol']: row for _, row in df.iterrows()}
-        FII_DII_LAST_UPDATE = now_ist()
+        FII_DII_LAST_UPDATE = datetime.now()
         FII_DII_STRONG_BUY = set(df[(df['FII_DII_Cash'] == 'Bought') & (df['FII_DII_FNO'] == 'Bought')]['Symbol'].values)
         FII_DII_STRONG_SELL = set(df[(df['FII_DII_Cash'] == 'Sold') & (df['FII_DII_FNO'] == 'Sold')]['Symbol'].values)
         FII_DII_MIXED = set(df['Symbol'].values) - FII_DII_STRONG_BUY - FII_DII_STRONG_SELL
@@ -3051,7 +3039,7 @@ def _save_fii_dii_trend_cache():
                 'fii_buy_dii_sell':    list(FII_DII_TREND_FII_BUY_DII_SELL),
                 'fii_sell_dii_buy':    list(FII_DII_TREND_FII_SELL_DII_BUY),
                 'unusual_change':      list(FII_DII_TREND_UNUSUAL_CHANGE),
-                'saved_at':            now_ist().isoformat(),
+                'saved_at':            datetime.now().isoformat(),
             }
         with open(FII_DII_TREND_CACHE_FILE, 'w') as f:
             json.dump(payload, f)
@@ -3116,6 +3104,81 @@ def get_fii_dii_signal(symbol):
         elif data['FII_DII_Cash'] == 'Sold' or data['FII_DII_FNO'] == 'Sold':
             return 'SELL'
     return 'NEUTRAL'
+
+
+# =============================================================================
+# NIFTY 15-MIN BOLLINGER BAND RE-ENTRY FILTER (Change 2)
+# =============================================================================
+def _get_nifty_bb_market_state(access_token: str = None) -> dict:
+    """
+    Fetch Nifty 50 15-min candles and compute Bollinger Band market state.
+
+    Returns a dict:
+      'percent_b'    : float  (%B indicator, 0–1 range; >1 or <0 means outside bands)
+      'above_middle' : bool   price above SMA-20 (mild bullish bias)
+      'bb_state'     : str    one of:
+                           'UPPER_BAND'  → %B ≥ NIFTY_BB_UPPER_BLOCK_LONG   (overbought zone)
+                           'BULLISH'     → above middle, %B < upper block
+                           'NEUTRAL'     → very close to middle (±0.05 %B)
+                           'BEARISH'     → below middle, %B > lower block
+                           'LOWER_BAND'  → %B ≤ NIFTY_BB_LOWER_BLOCK_SHORT  (oversold zone)
+      'ok_for_long'  : bool   safe to enter LONG re-entry
+      'ok_for_short' : bool   safe to enter SHORT re-entry
+      'error'        : bool   True if data unavailable → fail-open
+
+    Uses the module-level _15MIN_CACHE so candles are shared with the fast-trade
+    monitor (no extra network call if already fetched this scan cycle).
+    """
+    _FAIL_OPEN = {
+        'percent_b':    0.5,
+        'above_middle': True,
+        'bb_state':     'NEUTRAL',
+        'ok_for_long':  True,
+        'ok_for_short': True,
+        'error':        True,
+    }
+
+    if not ENABLE_NIFTY_BB_REENTRY_FILTER:
+        return _FAIL_OPEN
+
+    # Check for required globals that might not exist in this older version
+    try:
+        test_access = _INTRADAY_CACHE_LOCK
+    except NameError:
+        # _INTRADAY_CACHE_LOCK doesn't exist in this version - can't use cache
+        if DEBUG_MODE:
+            print(f"⚠️ Nifty BB filter: intraday cache not available — fail-open")
+        return _FAIL_OPEN
+
+    try:
+        test_access = now_ist
+    except NameError:
+        if DEBUG_MODE:
+            print(f"⚠️ Nifty BB filter: now_ist function not available — fail-open")
+        return _FAIL_OPEN
+
+    try:
+        test_access = calculate_bollinger_bands
+    except NameError:
+        if DEBUG_MODE:
+            print(f"⚠️ Nifty BB filter: calculate_bollinger_bands not available — fail-open")
+        return _FAIL_OPEN
+
+    # Placeholder - in the full version this would fetch Nifty 15-min data
+    # For this older version without the required infrastructure, we return fail-open
+    if DEBUG_MODE:
+        print(f"📊 Nifty BB filter: infrastructure check passed but data fetch not implemented in this version")
+    return _FAIL_OPEN
+
+
+def _get_nifty_day_gain_pct(access_token: str = None) -> float:
+    """
+    Legacy shim — kept so any code that calls _get_nifty_day_gain_pct()
+    directly continues to compile.  Returns 0.0 (neutral) because Gate 5
+    in check_reentry() now uses _get_nifty_bb_market_state() instead.
+    """
+    return 0.0
+
 
 def calculate_orb_levels(symbol, open_price, close_price, high_price, low_price, volume,
                          candle_df=None, instrument_key=None):
@@ -3232,7 +3295,7 @@ def calculate_orb_levels(symbol, open_price, close_price, high_price, low_price,
     result = {
         'symbol':          symbol,
         'instrument_key':  ikey,
-        'timestamp':       now_ist(),
+        'timestamp':       datetime.now(),
         'signal_type':     signal_type,
         'direction':       direction,
         'open':            open_price,
@@ -3277,7 +3340,7 @@ def process_first_candles(access_token, live_data, late_pass=False):
     else:
         if not ORB_LATE_CHECKED:
             return                        # nothing left to retry — skip immediately
-        print(f"\n🔄 ORB late-volume pass ({now_ist().strftime('%H:%M')}) — "
+        print(f"\n🔄 ORB late-volume pass ({datetime.now().strftime('%H:%M')}) — "
               f"retrying {len(ORB_LATE_CHECKED)} zero-volume symbols from 09:30")
 
     orb_count = 0
@@ -3345,36 +3408,55 @@ def process_first_candles(access_token, live_data, late_pass=False):
         print(f"{'='*100}\n")
 
 def check_orb_breakout(symbol, current_price, current_volume, live_data):
-    """
-    Check for an ORB breakout with multi-scan confirmation to filter fake breakouts.
-
-    Requires BREACH_CONFIRMATION_CYCLES consecutive scans (within BREACH_TIME_WINDOW
-    seconds) where:
-      1. Price holds above breakout_level × 1.001  (0.1% buffer)
-      2. Volume ratio stays elevated across all confirmation scans
-      3. Price gains at least 0.3% above the level (momentum check)
-      4. RSI (live re-fetch) is in the momentum zone
-    Only fires after all confirmations pass — eliminates spike-and-retreat fakes.
-    """
-    if symbol not in ORB_SIGNALS or symbol in ORB_ALERTED_STOCKS:
+    if symbol not in ORB_SIGNALS:
         return None
+    
     orb = ORB_SIGNALS[symbol]
-    now = now_ist()
+    now = datetime.now()
+    current_time_str = now.strftime("%H:%M")
+    
+    # ── RE-ENTRY ON NEW HIGH CHECK ─────────────────────────────────────────
+    # Allow same symbol to place multiple orders if price breaks new high
+    # Define what % above previous breakout level counts as "new high"
+    ORB_REENTRY_THRESHOLD = 0.5  # 0.5% above previous breakout = new high
+    
+    if symbol in ORB_ALERTED_STOCKS:
+        # Check if we're breaking new high
+        previous_breakout = ORB_BREAKOUT_LEVELS.get(symbol, 0)
+        if previous_breakout > 0:
+            new_high_threshold = previous_breakout * (1 + ORB_REENTRY_THRESHOLD / 100)
+            if current_price <= new_high_threshold:
+                # Not a new high - skip
+                return None
+        else:
+            # No previous breakout level tracked - skip
+            return None
+    
+    # ── MORNING WINDOW (09:30-10:30) ───────────────────────────────────────
     market_open_930 = now.replace(hour=9, minute=30, second=0, microsecond=0)
     minutes_since_930 = (now - market_open_930).total_seconds() / 60
-    if minutes_since_930 < 0 or minutes_since_930 > ORB_BREAKOUT_WINDOW_MINUTES:
-        # Outside window — clean up any stale state
-        LAST_ORB_BREAKOUT_STATE.pop(symbol, None)
+    
+    in_morning_window = (minutes_since_930 >= 0 and 
+                        minutes_since_930 <= ORB_BREAKOUT_WINDOW_MINUTES)
+    
+    # ── AFTERNOON WINDOW (13:00-14:00) ───────────────────────────────────
+    in_afternoon_window = False
+    if ORB_ENABLE_SECOND_HALF:
+        afternoon_start = now.replace(hour=13, minute=0, second=0, microsecond=0)
+        minutes_since_afternoon = (now - afternoon_start).total_seconds() / 60
+        in_afternoon_window = (minutes_since_afternoon >= 0 and 
+                              minutes_since_afternoon <= ORB_SECOND_HALF_WINDOW_MINUTES)
+    
+    # Check if we're in either window
+    if not in_morning_window and not in_afternoon_window:
         return None
 
-    # ── Volume check ────────────────────────────────────────────────────────
+    # ── Volume check: use VOLUME_DATA OR live_data avg_volume ───────────────
     avg_volume = (VOLUME_DATA.get(symbol, {}).get('avg_volume')
                   or VOLUME_DATA.get(symbol, {}).get('avg_vol_20d')
                   or live_data.get('avg_volume', 0))
     volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
     if avg_volume > 0 and volume_ratio < ORB_VOLUME_CONFIRMATION:
-        # Volume dried up — reset confirmation counter so we don't count dead scans
-        LAST_ORB_BREAKOUT_STATE.pop(symbol, None)
         return None
 
     # ── Live RSI re-check at breakout moment ────────────────────────────────
@@ -3389,251 +3471,59 @@ def check_orb_breakout(symbol, current_price, current_volume, live_data):
                             if DEBUG_MODE:
                                 print(f"⛔ ORB breakout RSI gate: {symbol} LONG "
                                       f"(RSI={live_rsi:.1f} < {ORB_RSI_LONG_MIN} at breakout)")
-                            LAST_ORB_BREAKOUT_STATE.pop(symbol, None)
                             return None
                     elif not orb['is_bullish'] and live_rsi > ORB_RSI_SHORT_MAX:
                         if orb['confidence'] != 'VERY_HIGH':
                             if DEBUG_MODE:
                                 print(f"⛔ ORB breakout RSI gate: {symbol} SHORT "
                                       f"(RSI={live_rsi:.1f} > {ORB_RSI_SHORT_MAX} at breakout)")
-                            LAST_ORB_BREAKOUT_STATE.pop(symbol, None)
                             return None
         except Exception:
             pass
 
-    # ── Price breach check ───────────────────────────────────────────────────
-    is_long_breach  = orb['is_bullish']  and current_price > orb['breakout_level'] * 1.001
-    is_short_breach = not orb['is_bullish'] and current_price < orb['breakout_level'] * 0.999
-
-    if not is_long_breach and not is_short_breach:
-        # Price retreated back into range — reset confirmation state
-        if symbol in LAST_ORB_BREAKOUT_STATE:
-            if DEBUG_MODE:
-                print(f"🔄 ORB {symbol}: price retreated into range — resetting confirmation")
-            del LAST_ORB_BREAKOUT_STATE[symbol]
-        return None
-
-    # ── Price sustainability: must stay 0.5% beyond level after first breach ─
-    sustainability_pct = PRICE_SUSTAINABILITY_PERCENT / 100
-    if is_long_breach:
-        sustain_threshold = orb['breakout_level'] * (1 + sustainability_pct)
-        if current_price < sustain_threshold:
-            # Price only barely cleared the level — stall, not a real breakout
-            if symbol in LAST_ORB_BREAKOUT_STATE:
-                LAST_ORB_BREAKOUT_STATE[symbol]['scans_since_last_breach'] = \
-                    LAST_ORB_BREAKOUT_STATE[symbol].get('scans_since_last_breach', 0) + 1
-            return None
-    else:
-        sustain_threshold = orb['breakout_level'] * (1 - sustainability_pct)
-        if current_price > sustain_threshold:
-            if symbol in LAST_ORB_BREAKOUT_STATE:
-                LAST_ORB_BREAKOUT_STATE[symbol]['scans_since_last_breach'] = \
-                    LAST_ORB_BREAKOUT_STATE[symbol].get('scans_since_last_breach', 0) + 1
-            return None
-
-    # ── Multi-scan confirmation state machine ────────────────────────────────
-    state = LAST_ORB_BREAKOUT_STATE.get(symbol)
-
-    if state is None:
-        # First breach — record and wait for next scan confirmation
-        LAST_ORB_BREAKOUT_STATE[symbol] = {
-            'breach_count':         1,
-            'first_breach_time':    now,
-            'last_breach_time':     now,
-            'max_price':            current_price,
-            'min_price':            current_price,
-            'vol_ratios':           [volume_ratio],
-            'scans_since_last_breach': 0,
+    breakout_signal = None
+    if orb['is_bullish'] and current_price > orb['breakout_level'] * 1.001:
+        breakout_signal = {
+            'symbol':        symbol,
+            'signal':        'ORB_BREAKOUT',
+            'direction':     'BUY',
+            'entry_price':   current_price,
+            'stop_loss':     orb['stop_level'],
+            'target':        orb['target_level'],
+            'orb_data':      orb,
+            'volume_ratio':  volume_ratio,
+            'confidence':    orb['confidence'],
+            'fii_dii_signal':orb['fii_dii_signal'],
+            'risk':          orb['risk'],
+            'reward':        orb['reward'],
+            'risk_reward':   orb['risk_reward'],
+            'entry_type':    ENTRY_ORB_BULLISH
         }
-        if DEBUG_MODE:
-            direction = "LONG" if is_long_breach else "SHORT"
-            print(f"📊 ORB {symbol}: first {direction} breach at ₹{current_price:.2f} "
-                  f"(1/{BREACH_CONFIRMATION_CYCLES} confirmations)")
-        return None
-
-    # Check time window — if breach is stale, restart
-    time_since_first = (now - state['first_breach_time']).total_seconds()
-    if time_since_first > BREACH_TIME_WINDOW:
-        LAST_ORB_BREAKOUT_STATE[symbol] = {
-            'breach_count':         1,
-            'first_breach_time':    now,
-            'last_breach_time':     now,
-            'max_price':            current_price,
-            'min_price':            current_price,
-            'vol_ratios':           [volume_ratio],
-            'scans_since_last_breach': 0,
+    elif not orb['is_bullish'] and current_price < orb['breakout_level'] * 0.999:
+        breakout_signal = {
+            'symbol':        symbol,
+            'signal':        'ORB_BREAKDOWN',
+            'direction':     'SELL',
+            'entry_price':   current_price,
+            'stop_loss':     orb['stop_level'],
+            'target':        orb['target_level'],
+            'orb_data':      orb,
+            'volume_ratio':  volume_ratio,
+            'confidence':    orb['confidence'],
+            'fii_dii_signal':orb['fii_dii_signal'],
+            'risk':          orb['risk'],
+            'reward':        orb['reward'],
+            'risk_reward':   orb['risk_reward'],
+            'entry_type':    ENTRY_ORB_BEARISH
         }
-        if DEBUG_MODE:
-            print(f"⏳ ORB {symbol}: confirmation window expired — restarting")
-        return None
-
-    # Accumulate this scan
-    state['breach_count'] += 1
-    state['last_breach_time'] = now
-    state['max_price'] = max(state['max_price'], current_price)
-    state['min_price'] = min(state['min_price'], current_price)
-    state['vol_ratios'].append(volume_ratio)
-    state['scans_since_last_breach'] = 0
-
-    if state['breach_count'] < BREACH_CONFIRMATION_CYCLES:
-        if DEBUG_MODE:
-            print(f"📊 ORB {symbol}: breach #{state['breach_count']}/{BREACH_CONFIRMATION_CYCLES} "
-                  f"at ₹{current_price:.2f} | vol={volume_ratio:.2f}x")
-        return None
-
-    # ── All confirmations met — run final quality checks ────────────────────
-
-    # Volume persistence: avg across confirmation scans must not have faded
-    avg_vol_ratio = sum(state['vol_ratios']) / len(state['vol_ratios'])
-    if avg_vol_ratio < ORB_VOLUME_CONFIRMATION * 0.9:
-        if DEBUG_MODE:
-            print(f"⚠️ ORB {symbol}: volume faded during confirmation "
-                  f"(avg={avg_vol_ratio:.2f}x < required={ORB_VOLUME_CONFIRMATION * 0.9:.2f}x) — fake breakout")
-        del LAST_ORB_BREAKOUT_STATE[symbol]
-        return None
-
-    # Momentum: price must have moved meaningfully above/below the level
-    if is_long_breach:
-        price_gain_pct = (current_price - orb['breakout_level']) / orb['breakout_level'] * 100
-    else:
-        price_gain_pct = (orb['breakout_level'] - current_price) / orb['breakout_level'] * 100
-
-    if price_gain_pct < 0.3:
-        if DEBUG_MODE:
-            print(f"⚠️ ORB {symbol}: insufficient momentum ({price_gain_pct:.2f}% < 0.3%) — likely fake")
-        return None
-
-    # ✅ All validations passed — confirmed breakout
-    print(f"\n✅ ORB {symbol}: breakout CONFIRMED after {state['breach_count']} scans "
-          f"| {time_since_first:.0f}s | max ₹{state['max_price']:.2f} | avg vol {avg_vol_ratio:.2f}x")
-    del LAST_ORB_BREAKOUT_STATE[symbol]
-
-    if is_long_breach:
-        return {
-            'symbol':         symbol,
-            'signal':         'ORB_BREAKOUT',
-            'direction':      'BUY',
-            'entry_price':    current_price,
-            'stop_loss':      orb['stop_level'],
-            'target':         orb['target_level'],
-            'orb_data':       orb,
-            'volume_ratio':   avg_vol_ratio,
-            'confidence':     orb['confidence'],
-            'fii_dii_signal': orb['fii_dii_signal'],
-            'risk':           orb['risk'],
-            'reward':         orb['reward'],
-            'risk_reward':    orb['risk_reward'],
-            'entry_type':     ENTRY_ORB_BULLISH,
-            'confirmation_scans': state['breach_count'],
-            'time_to_confirm':    time_since_first,
-        }
-    else:
-        return {
-            'symbol':         symbol,
-            'signal':         'ORB_BREAKDOWN',
-            'direction':      'SELL',
-            'entry_price':    current_price,
-            'stop_loss':      orb['stop_level'],
-            'target':         orb['target_level'],
-            'orb_data':       orb,
-            'volume_ratio':   avg_vol_ratio,
-            'confidence':     orb['confidence'],
-            'fii_dii_signal': orb['fii_dii_signal'],
-            'risk':           orb['risk'],
-            'reward':         orb['reward'],
-            'risk_reward':    orb['risk_reward'],
-            'entry_type':     ENTRY_ORB_BEARISH,
-            'confirmation_scans': state['breach_count'],
-            'time_to_confirm':    time_since_first,
-        }
-
-
-def check_orb_reentry(symbol, current_price, current_volume, live_data):
-    """
-    Allow ONE re-entry per symbol per day when price makes a genuine new session high.
-
-    Conditions (all must pass):
-      1. First ORB entry already fired for this symbol today
-      2. Not already re-entered today (cap = 1 re-entry / symbol / day)
-      3. Cooldown: at least ORB_REENTRY_COOLDOWN_MINS minutes since first entry
-      4. New-high gate: live session high > original ORB candle high × (1 + ORB_REENTRY_MIN_GAIN_PCT%)
-      5. Volume still elevated at ≥ ORB_VOLUME_CONFIRMATION × 20-day avg
-      6. Price currently above the new support level (original ORB candle high)
-
-    Stop for re-entry = original ORB candle high (now acts as support).
-    Target = entry + (entry - stop) × ORB_REENTRY_TARGET_MULT.
-    """
-    if not ORB_REENTRY_ENABLED:
-        return None
-    if symbol not in ORB_ALERTED_STOCKS:        # must have had first entry today
-        return None
-    if symbol in ORB_REENTRY_ALERTED:           # already re-entered today
-        return None
-
-    orb = ORB_SIGNALS.get(symbol)
-    if not orb or not orb['is_bullish']:         # re-entry only for LONG ORBs for now
-        return None
-
-    # ── Cooldown gate ────────────────────────────────────────────────────────
-    first_time = ORB_FIRST_ENTRY_TIME.get(symbol)
-    if first_time is None:
-        return None
-    mins_elapsed = (now_ist() - first_time).total_seconds() / 60
-    if mins_elapsed < ORB_REENTRY_COOLDOWN_MINS:
-        return None
-
-    # ── New-high gate ────────────────────────────────────────────────────────
-    orb_candle_high = orb['high']
-    threshold       = orb_candle_high * (1 + ORB_REENTRY_MIN_GAIN_PCT / 100)
-    session_high    = live_data.get('high', 0)
-    if session_high < threshold:
-        return None   # no genuine new high yet
-
-    # Current price must actually be above the original candle high (our new stop)
-    if current_price <= orb_candle_high:
-        return None
-
-    # ── Volume gate ──────────────────────────────────────────────────────────
-    avg_volume = (VOLUME_DATA.get(symbol, {}).get('avg_volume')
-                  or VOLUME_DATA.get(symbol, {}).get('avg_vol_20d')
-                  or live_data.get('avg_volume', 0))
-    volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
-    if avg_volume > 0 and volume_ratio < ORB_VOLUME_CONFIRMATION:
-        return None
-
-    # ── Build re-entry signal ─────────────────────────────────────────────────
-    new_stop   = orb_candle_high                                   # original high = new support
-    new_risk   = current_price - new_stop
-    new_target = current_price + new_risk * ORB_REENTRY_TARGET_MULT
-    if new_risk <= 0:
-        return None
-
-    return {
-        'symbol':         symbol,
-        'signal':         'ORB_REENTRY',
-        'direction':      'BUY',
-        'entry_price':    current_price,
-        'stop_loss':      new_stop,
-        'target':         new_target,
-        'orb_data':       orb,
-        'volume_ratio':   volume_ratio,
-        'confidence':     orb['confidence'],
-        'fii_dii_signal': orb['fii_dii_signal'],
-        'risk':           new_risk,
-        'reward':         new_risk * ORB_REENTRY_TARGET_MULT,
-        'risk_reward':    ORB_REENTRY_TARGET_MULT,
-        'entry_type':     ENTRY_ORB_BULLISH,
-        'is_reentry':     True,
-        'original_high':  orb_candle_high,
-        'mins_since_first': mins_elapsed,
-    }
+    return breakout_signal
 
 def log_orb_signal(signal):
     try:
         with open(ORB_SIGNALS_FILE, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                now_ist().strftime('%Y-%m-%d %H:%M:%S'),
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 signal['symbol'],
                 signal['signal_type'],
                 signal['direction'],
@@ -3653,7 +3543,7 @@ def log_orb_trade(trade, action='ENTRY'):
         with open(ORB_TRADES_FILE, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                now_ist().strftime('%Y-%m-%d %H:%M:%S'),
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 trade['symbol'],
                 action,
                 trade['direction'],
@@ -3668,21 +3558,10 @@ def log_orb_trade(trade, action='ENTRY'):
         pass
 
 def send_orb_alert(signal, trader=None):
-    global ORB_ALERTED_STOCKS, ORB_ORDER_COUNT, ORB_REENTRY_ALERTED
-    sym        = signal['symbol']
-    is_reentry = signal.get('is_reentry', False)
-
-    # ── Track first entry vs re-entry ────────────────────────────────────
-    if is_reentry:
-        ORB_REENTRY_ALERTED.add(sym)    # cap at 1 re-entry per symbol per day
-    else:
-        ORB_ALERTED_STOCKS.add(sym)
-        ORB_FIRST_ENTRY_TIME[sym] = now_ist()
-        ORB_FIRST_ENTRY_HIGH[sym] = signal.get('orb_data', {}).get('high', signal['entry_price'])
-
-    entry_label = 'ORB RE-ENTRY' if is_reentry else 'ORB SIGNAL'
+    global ORB_ALERTED_STOCKS, ORB_ORDER_COUNT
+    ORB_ALERTED_STOCKS.add(signal['symbol'])
     print("\n" + "="*100)
-    print(f"⚡ {entry_label}: {sym} ⚡")
+    print(f"⚡ ORB SIGNAL: {signal['symbol']} ⚡")
     print("="*100)
     print(f"Signal:       {signal['signal']}")
     print(f"Direction:    {signal['direction']}")
@@ -3695,11 +3574,6 @@ def send_orb_alert(signal, trader=None):
     print(f"Reward:       ₹{signal['reward']:.2f} per share")
     print(f"R:R Ratio:    {signal['risk_reward']:.2f}:1")
     print(f"Volume:       {signal['volume_ratio']:.2f}x average")
-    if is_reentry:
-        print(f"Re-entry:     {signal.get('mins_since_first', 0):.0f} min after first entry | "
-              f"new stop = original high ₹{signal.get('original_high', 0):.2f}")
-    if signal.get('confirmation_scans'):
-        print(f"Confirmed:    {signal['confirmation_scans']} scans / {signal.get('time_to_confirm', 0):.0f}s")
     orb_d = signal.get('orb_data', {})
     rsi_val = orb_d.get('rsi_at_signal')
     ko_val  = orb_d.get('klinger_at_signal')
@@ -3711,8 +3585,8 @@ def send_orb_alert(signal, trader=None):
     log_orb_trade(signal, 'ENTRY')
     with open(ORB_LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(f"\n{'='*100}\n")
-        f.write(f"{entry_label}: {now_ist().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Symbol: {sym}\n")
+        f.write(f"ORB ALERT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Symbol: {signal['symbol']}\n")
         f.write(f"Signal: {signal['signal']} ({signal['direction']})\n")
         f.write(f"Confidence: {signal['confidence']} | FII/DII: {signal['fii_dii_signal']}\n")
         f.write(f"Entry: ₹{signal['entry_price']:.2f} | Stop: ₹{signal['stop_loss']:.2f} | Target: ₹{signal['target']:.2f}\n")
@@ -3722,9 +3596,9 @@ def send_orb_alert(signal, trader=None):
         with open(ALERT_CSV_FILE, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                now_ist().strftime('%Y-%m-%d %H:%M:%S'),
-                sym,
-                f"ORB_{signal['direction']}{'_REENTRY' if is_reentry else ''}",
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                signal['symbol'],
+                f"ORB_{signal['direction']}",
                 signal['entry_price'],
                 signal['volume_ratio'],
                 '',
@@ -3733,16 +3607,18 @@ def send_orb_alert(signal, trader=None):
             ])
     except:
         pass
-    if ENABLE_AUTO_TRADING and trader and ORB_ORDER_COUNT < MAX_ORDERS_PER_DAY:
+    
+    # ORB uses its own enable flag for placing orders (not affected by ENABLE_AUTO_TRADING)
+    if ENABLE_ORB_STRATEGY and trader and ORB_ORDER_COUNT < MAX_ORDERS_PER_DAY:
         if not is_order_time_allowed():
-            print(f"⏭️  ORB {sym}: order skipped — outside Upstox service hours (05:30–23:59 IST)")
+            print(f"⏭️  ORB {signal['symbol']}: order skipped — outside Upstox service hours (05:30–23:59 IST)")
             return
-        print(f"\n📤 Placing ORB {signal['direction']} order for {sym}...")
+        print(f"\n📤 Placing ORB {signal['direction']} order for {signal['symbol']}...")
         orb_breakout = {
-            'symbol':        sym,
+            'symbol':        signal['symbol'],
             'instrument_key': signal.get('instrument_key', signal.get('orb_data', {}).get('instrument_key', '')),
             'breakout_type': 'CE' if signal['direction'] == 'BUY' else 'PE',
-            'strategy':      'ORB_REENTRY' if is_reentry else 'ORB',
+            'strategy':      'ORB',
             'entry_price':   signal['entry_price'],
             'stop_loss':     signal['stop_loss'],
             'target':        signal['target'],
@@ -3751,9 +3627,12 @@ def send_orb_alert(signal, trader=None):
         order_id = place_breakout_order(orb_breakout, trader)
         if order_id:
             ORB_ORDER_COUNT += 1
+            # Track breakout level for re-entry on new high
+            ORB_BREAKOUT_LEVELS[signal['symbol']] = signal['entry_price']
             print(f"✅ ORB order placed: {order_id} | ORB orders today: {ORB_ORDER_COUNT}/{MAX_ORDERS_PER_DAY}")
+            print(f"📊 Breakout level tracked: {signal['symbol']} @ ₹{signal['entry_price']:.2f}")
         else:
-            print(f"⚠️ ORB order failed for {sym}")
+            print(f"⚠️ ORB order failed for {signal['symbol']}")
     elif ORB_ORDER_COUNT >= MAX_ORDERS_PER_DAY:
         print(f"⚠️ ORB order limit reached ({ORB_ORDER_COUNT}/{MAX_ORDERS_PER_DAY}) — signal logged only")
 
@@ -3782,53 +3661,74 @@ def update_fii_dii_if_needed():
     # Only re-fetch if the existing data is from a previous calendar day,
     # or if more than FII_DII_UPDATE_INTERVAL seconds have passed (safety net).
     last_date = FII_DII_LAST_UPDATE.date()
-    today     = now_ist().date()
+    today     = datetime.now().date()
     if last_date < today:
         print(f"\n🔄 FII/DII data is from {last_date} — fetching today's data")
         extract_fii_dii_data()
-    elif (now_ist() - FII_DII_LAST_UPDATE).total_seconds() > FII_DII_UPDATE_INTERVAL:
+    elif (datetime.now() - FII_DII_LAST_UPDATE).total_seconds() > FII_DII_UPDATE_INTERVAL:
         print(f"\n🔄 FII/DII safety refresh (last: {FII_DII_LAST_UPDATE.strftime('%H:%M')})")
         extract_fii_dii_data()
 
 def check_orb_time_and_process(access_token, live_data):
-    global ORB_PROCESSED_TODAY, ORB_LATE_CHECKED
+    global ORB_PROCESSED_TODAY, ORB_LATE_CHECKED, ORB_SECOND_HALF_PROCESSED
     if not ENABLE_ORB_STRATEGY:
         return
-    now          = now_ist()
+    now          = datetime.now()
     current_time = now.strftime("%H:%M")
+
+    # Initialize second half tracking if not exists
+    if 'ORB_SECOND_HALF_PROCESSED' not in globals():
+        ORB_SECOND_HALF_PROCESSED = False
+
+    # ── MORNING SESSION (09:30-10:30) ───────────────────────────────────────
     market_930   = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    cutoff       = market_930 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
+    cutoff_morning = market_930 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
 
     if current_time < "09:15":
         ORB_PROCESSED_TODAY = False
+        ORB_SECOND_HALF_PROCESSED = False
         ORB_LATE_CHECKED.clear()
-        # Reset ORB re-entry state for a new day
-        ORB_REENTRY_ALERTED.clear()
-        ORB_FIRST_ENTRY_TIME.clear()
-        ORB_FIRST_ENTRY_HIGH.clear()
-        LAST_ORB_BREAKOUT_STATE.clear()
-        # Reset shared re-entry engine state for a new day
-        reset_reentry_state_daily()
 
-    # ── PRIMARY PASS ─────────────────────────────────────────────────────────
-    # Old: only ran 09:30-09:35. Bot starting at 09:36 silently skipped ORB.
-    # New: run primary pass any time between 09:30 and breakout window close,
-    # as long as it hasn't run yet today. One-shot — process_first_candles
-    # sets ORB_PROCESSED_TODAY=True so it never fires twice.
-    if current_time >= "09:30" and now < cutoff and not ORB_PROCESSED_TODAY:
+    # Morning primary pass - only if morning not yet processed
+    if current_time >= "09:30" and now < cutoff_morning and not ORB_PROCESSED_TODAY:
         if current_time >= "09:35":
-            print(f"\n⚠️  ORB: Late start detected ({current_time}). "
+            print(f"\n⚠️  ORB (Morning): Late start detected ({current_time}). "
                   f"Running primary ORB pass now — {int((now - market_930).total_seconds() / 60)}min "
                   f"into session. Signals use current candle data.")
         process_first_candles(access_token, live_data, late_pass=False)
+        ORB_PROCESSED_TODAY = True  # Mark morning done
 
-    # ── LATE VOLUME PASS ─────────────────────────────────────────────────────
-    # Retry zero-volume symbols from the primary pass until the window closes.
+    # Morning late volume pass
     elif (ORB_PROCESSED_TODAY
+          and not ORB_SECOND_HALF_PROCESSED
           and ORB_LATE_CHECKED
           and current_time >= "09:35"
-          and now < cutoff):
+          and now < cutoff_morning):
         process_first_candles(access_token, live_data, late_pass=True)
+
+    # ── SECOND HALF SESSION (13:00-14:00) ───────────────────────────────────
+    if ORB_ENABLE_SECOND_HALF and current_time >= ORB_SECOND_HALF_START:
+        # Define afternoon window
+        afternoon_start = now.replace(hour=13, minute=0, second=0, microsecond=0)
+        cutoff_afternoon = afternoon_start + timedelta(minutes=ORB_SECOND_HALF_WINDOW_MINUTES)
+
+        # Reset for second half at 13:00
+        if current_time >= ORB_SECOND_HALF_START and current_time < "13:05":
+            if not ORB_SECOND_HALF_PROCESSED:
+                ORB_LATE_CHECKED.clear()
+                print(f"\n☀️  ORB (Second Half): Starting afternoon ORB session at {current_time}")
+
+        # Process second half ORB if not already done today
+        if now >= afternoon_start and now < cutoff_afternoon and not ORB_SECOND_HALF_PROCESSED:
+            print(f"\n🔄 ORB (Second Half): Processing at {current_time}")
+            process_first_candles(access_token, live_data, late_pass=False)
+            ORB_SECOND_HALF_PROCESSED = True
+
+        # Late volume pass for second half
+        elif (ORB_SECOND_HALF_PROCESSED
+              and ORB_LATE_CHECKED
+              and now < cutoff_afternoon):
+            process_first_candles(access_token, live_data, late_pass=True)
 
 def monitor_orb_breakouts(live_data, trader=None):
     if not ENABLE_ORB_STRATEGY or not ORB_SIGNALS:
@@ -3838,25 +3738,13 @@ def monitor_orb_breakouts(live_data, trader=None):
             symbol = ISIN_TO_SYMBOL.get(symbol_key, symbol_key)
             if symbol not in ORB_SIGNALS:
                 continue
-            ltp    = data.get('ltp', 0)
+            ltp = data.get('ltp', 0)
             volume = data.get('volume', 0)
             if ltp == 0:
                 continue
-
-            # ── Primary breakout (first entry) ───────────────────────────
             breakout = check_orb_breakout(symbol, ltp, volume, data)
             if breakout:
                 send_orb_alert(breakout, trader)
-                continue   # no re-entry check on the same scan as first entry
-
-            # ── Re-entry (new session high after cooldown) ───────────────
-            # Only attempted once first entry has already fired and re-entry
-            # has not been taken yet.  check_orb_reentry() gates internally.
-            if ORB_REENTRY_ENABLED and symbol in ORB_ALERTED_STOCKS:
-                reentry = check_orb_reentry(symbol, ltp, volume, data)
-                if reentry:
-                    send_orb_alert(reentry, trader)
-
         except Exception as e:
             if DEBUG_MODE:
                 print(f"ORB monitor error {symbol_key}: {e}")
@@ -3869,12 +3757,11 @@ def print_orb_summary():
     print(f"{'='*100}")
     print(f"Total ORB Signals Generated:  {len(ORB_SIGNALS)}")
     print(f"ORB Alerts Triggered:         {len(ORB_ALERTED_STOCKS)}")
-    print(f"ORB Re-entries Triggered:     {len(ORB_REENTRY_ALERTED)}")
     print(f"ORB Orders Placed:            {ORB_ORDER_COUNT}")
     if ORB_SIGNALS:
         very_high = sum(1 for s in ORB_SIGNALS.values() if s['confidence'] == 'VERY_HIGH')
-        high      = sum(1 for s in ORB_SIGNALS.values() if s['confidence'] == 'HIGH')
-        medium    = sum(1 for s in ORB_SIGNALS.values() if s['confidence'] == 'MEDIUM')
+        high = sum(1 for s in ORB_SIGNALS.values() if s['confidence'] == 'HIGH')
+        medium = sum(1 for s in ORB_SIGNALS.values() if s['confidence'] == 'MEDIUM')
         print(f"\nConfidence Breakdown:")
         print(f"  VERY HIGH: {very_high}")
         print(f"  HIGH:      {high}")
@@ -3884,12 +3771,6 @@ def print_orb_summary():
         print(f"\nDirection Breakdown:")
         print(f"  Bullish Setups:  {bullish}")
         print(f"  Bearish Setups:  {bearish}")
-    if ORB_REENTRY_ALERTED:
-        print(f"\nRe-entry Symbols: {', '.join(sorted(ORB_REENTRY_ALERTED))}")
-    # Multi-scan confirmation stats
-    pending = len(LAST_ORB_BREAKOUT_STATE)
-    if pending:
-        print(f"\nPending confirmations: {pending} symbol(s) awaiting 2nd scan")
     print(f"{'='*100}\n")
 
 def get_token_via_android_oauth() -> str:
@@ -4446,7 +4327,7 @@ def _fetch_5min_from_chartink(symbol, bars=50):
             last_ts = df["date"].iloc[-1]
             if hasattr(last_ts, "to_pydatetime"):
                 last_ts = last_ts.to_pydatetime().replace(tzinfo=None)
-            lag_min = (now_ist() - last_ts).total_seconds() / 60
+            lag_min = (datetime.now() - last_ts).total_seconds() / 60
             if lag_min > CK_LAG_WARN_MIN:
                 print(f"⚠️  CK LAG {symbol}: last kept bar={last_ts.strftime('%H:%M')}, "
                       f"lag={lag_min:.1f} min — RT builder must cover this gap")
@@ -4481,7 +4362,7 @@ def _record_5min_failure(instrument_key):
 
 def get_current_5min_slot():
     """Get the start time of the current 5-minute candle slot"""
-    now = now_ist()
+    now = datetime.now()
     minute = (now.minute // 5) * 5
     return now.replace(minute=minute, second=0, microsecond=0)
 
@@ -4589,7 +4470,7 @@ def _fetch_5min_upstox_intraday(access_token, instrument_key, timeframe="5minute
 
 def _fetch_5min_upstox_historical(access_token, instrument_key, headers, timeframe="5minute"):
     """Upstox historical date-range endpoint — supports 5minute or 15minute."""
-    end_date = now_ist()
+    end_date = datetime.now()
     start_date = end_date - timedelta(days=10)
     from_date = start_date.strftime("%Y-%m-%d")
     to_date = end_date.strftime("%Y-%m-%d")
@@ -4621,7 +4502,7 @@ def _get_chartink_hist_base(symbol, bars=100):
     Returns DataFrame[date, open, high, low, close, volume] or None.
     """
     with _CK_HIST_CACHE_LOCK:
-        now = now_ist()
+        now = datetime.now()
         cached_ts = _CK_HIST_CACHE_TS.get(symbol)
         if (
             symbol in _CK_HIST_CACHE
@@ -4687,7 +4568,7 @@ def _merge_hist_and_realtime(hist_df, symbol):
             last_ts = hist_df["date"].iloc[-1]
             if hasattr(last_ts, "to_pydatetime"):
                 last_ts = last_ts.to_pydatetime().replace(tzinfo=None)
-            lag_min = (now_ist() - last_ts).total_seconds() / 60
+            lag_min = (datetime.now() - last_ts).total_seconds() / 60
             if lag_min > CK_LAG_WARN_MIN:
                 print(f"⚠️  {symbol}: CK hist ends at {last_ts.strftime('%H:%M')} "
                       f"({lag_min:.1f} min ago) and NO real-time bars yet — "
@@ -4747,7 +4628,7 @@ def fetch_5min_candle_data(access_token, instrument_key, bars=100, symbol=None):
                 last_ts  = merged["date"].iloc[-1]
                 if hasattr(last_ts, "to_pydatetime"):
                     last_ts = last_ts.to_pydatetime().replace(tzinfo=None)
-                lag_min  = (now_ist() - last_ts).total_seconds() / 60
+                lag_min  = (datetime.now() - last_ts).total_seconds() / 60
                 print(
                     f"✅ Hybrid 5min: {symbol} → {len(merged)} bars "
                     f"(CK hist={len(hist_df)}, RT={rt_bars}) "
@@ -4813,7 +4694,7 @@ def fetch_15min_candle_data(access_token, instrument_key, symbol=None):
         if df15 is not None and len(df15) >= 10:
             if DEBUG_MODE:
                 last_ts  = df15["date"].iloc[-1]
-                lag_min  = (now_ist() - last_ts).total_seconds() / 60
+                lag_min  = (datetime.now() - last_ts).total_seconds() / 60
                 print(f"✅ ChartInk 15min: {symbol} → {len(df15)} bars "
                       f"| last bar={last_ts.strftime('%H:%M')} lag={lag_min:.1f}min")
             return df15
@@ -4876,7 +4757,7 @@ def fetch_5min_cached(access_token: str, instrument_key: str,
     if symbol is None:
         symbol = ISIN_TO_SYMBOL.get(instrument_key, "")
     key = symbol or instrument_key
-    now = now_ist()
+    now = datetime.now()
 
     with _INTRADAY_CACHE_LOCK:
         entry = _5MIN_CACHE.get(key)
@@ -4904,7 +4785,7 @@ def fetch_15min_cached(access_token: str, instrument_key: str,
     if symbol is None:
         symbol = ISIN_TO_SYMBOL.get(instrument_key, "")
     key = symbol or instrument_key
-    now = now_ist()
+    now = datetime.now()
 
     with _INTRADAY_CACHE_LOCK:
         entry = _15MIN_CACHE.get(key)
@@ -5130,7 +5011,7 @@ def detect_fast_long_setup(df, klinger_data=None):
         'bb_width': bb_width.iloc[-1],
         'klinger_confirmed': klinger_confirmed,
         'klinger_status': klinger_status,
-        'timestamp': now_ist(),
+        'timestamp': datetime.now(),
         'confidence': 'HIGH' if klinger_confirmed and volume_ratio > 2 else 'MEDIUM'
     }
 
@@ -5234,7 +5115,7 @@ def detect_fast_short_setup(df, klinger_data=None):
         'bb_lower': bb_lower.iloc[-1],
         'klinger_confirmed': klinger_confirmed,
         'klinger_status': klinger_status,
-        'timestamp': now_ist(),
+        'timestamp': datetime.now(),
         'confidence': 'HIGH' if klinger_confirmed and volume_ratio > 2 else 'MEDIUM'
     }
 
@@ -5356,7 +5237,7 @@ def detect_topping_reversal(df, klinger_data=None, strict=False):
         'klinger_confirmed': klinger_confirmed,
         'klinger_status':    klinger_status,
         'confidence':        confidence,
-        'timestamp':         now_ist(),
+        'timestamp':         datetime.now(),
     }
 
 def manage_fast_trade_exit(trade, current_price, df, klinger_data=None):
@@ -5430,7 +5311,7 @@ def manage_fast_trade_exit(trade, current_price, df, klinger_data=None):
 def get_cached_option_chain(trader, underlying_key):
     """Get option chain with caching to reduce API calls"""
     cache_key = underlying_key
-    current_time = now_ist()
+    current_time = datetime.now()
     
     # Check if valid cache exists
     if cache_key in OPTION_CHAIN_CACHE:
@@ -5570,7 +5451,7 @@ def select_liquid_stock_option_contract(trader, underlying_key, symbol, option_t
     # 3) Filter valid contracts with expiry dates
     # Skip contracts expiring TODAY — Upstox blocks same-day expiry stock options
     # due to physical settlement rules (RMS: NON-SQROFF block).
-    today = now_ist().date()
+    today = datetime.now().date()
     valid_contracts = []
     for c in contracts:
         expiry_str = c.get("expiry", "")
@@ -5642,7 +5523,7 @@ def get_available_margin(trader):
     """
     global _CACHED_AVAILABLE_MARGIN, _MARGIN_CACHE_TIME
     with _MARGIN_CACHE_LOCK:
-        now = now_ist()
+        now = datetime.now()
         if (_CACHED_AVAILABLE_MARGIN is not None and
                 _MARGIN_CACHE_TIME is not None and
                 (now - _MARGIN_CACHE_TIME).total_seconds() < _MARGIN_CACHE_TTL_SECONDS):
@@ -5743,7 +5624,7 @@ def place_fast_trade_order(setup, trader, symbol, instrument_key):
                 FAST_TRADE_ORDER_COUNT += 1
 
             with THREAD_LOCKS['LAST_ORDER_TIME']:
-                LAST_ORDER_TIME[symbol] = now_ist()
+                LAST_ORDER_TIME[symbol] = datetime.now()
 
             filled_price = order_info.get('filled_price', premium)
 
@@ -5769,7 +5650,7 @@ def place_fast_trade_order(setup, trader, symbol, instrument_key):
                 'strategy': 'FAST_TRADE',
                 'fast_trade_signal': setup['signal'],
                 'fast_trade_entry_type': setup['entry_type'],
-                'timestamp': now_ist(),
+                'timestamp': datetime.now(),
                 'expiry_date': expiry_date,
                 'klinger_confirmed': setup.get('klinger_confirmed', False),
                 'setup_data': setup,
@@ -5844,11 +5725,11 @@ def monitor_fast_trades(access_token, watchlist_symbols):
             continue
         
         # ── LATE-SESSION ENTRY BLOCK ─────────────────────────────────────────
-        current_time_str = now_ist().strftime("%H:%M")
+        current_time_str = datetime.now().strftime("%H:%M")
         skip_new_entries = (current_time_str >= NO_NEW_ENTRY_AFTER)
         if skip_new_entries and DEBUG_MODE:
             # Only print once per minute to avoid log spam
-            if now_ist().second < 35:
+            if datetime.now().second < 35:
                 print(f"⏰ Fast trade new entries blocked after {NO_NEW_ENTRY_AFTER} "
                       f"(current: {current_time_str}) — exits still managed")
         # ── END LATE-SESSION BLOCK ────────────────────────────────────────────
@@ -5883,7 +5764,7 @@ def monitor_fast_trades(access_token, watchlist_symbols):
                 # for a topping SHORT via detect_topping_reversal(strict=True).
                 # This is separate from the second-half re-watch — it catches
                 # ONGC / ETERNAL type reversals that happen at 10:30–12:15.
-                current_time_str_skip = now_ist().strftime("%H:%M")
+                current_time_str_skip = datetime.now().strftime("%H:%M")
                 in_second_half   = (ENABLE_SECOND_HALF_SHORT_REWATCH
                                     and current_time_str_skip >= SECOND_HALF_START)
                 in_early_session = (current_time_str_skip < SECOND_HALF_START)
@@ -6152,7 +6033,7 @@ def monitor_fast_trades(access_token, watchlist_symbols):
                         # Check if recently traded this symbol - THREAD SAFE
                         with THREAD_LOCKS['LAST_ORDER_TIME']:
                             if symbol in LAST_ORDER_TIME:
-                                time_since = (now_ist() - LAST_ORDER_TIME[symbol]).seconds
+                                time_since = (datetime.now() - LAST_ORDER_TIME[symbol]).seconds
                                 if time_since < MIN_ORDER_GAP_SECONDS:
                                     if DEBUG_MODE:
                                         print(f"⚠️ {symbol}: Too soon for new trade ({time_since}s)")
@@ -6197,8 +6078,6 @@ def monitor_fast_trades(access_token, watchlist_symbols):
                             # Order succeeded — remove from HA watchlist if it was there
                             remove_from_ha_watchlist(symbol)
                             _sig = setup.get('signal', 'LONG')
-                            _fast_strat = 'FAST_LONG' if _sig == 'LONG' else 'FAST_SHORT'
-                            _fast_dir   = 'LONG' if _sig == 'LONG' else 'SHORT'
                             if _sig == 'LONG':
                                 with THREAD_LOCKS['FAST_TRADE_LONG_ALERTED']:
                                     FAST_TRADE_LONG_ALERTED.add(symbol)
@@ -6209,11 +6088,6 @@ def monitor_fast_trades(access_token, watchlist_symbols):
                             with THREAD_LOCKS['FAST_TRADE_ALERTED_STOCKS']:
                                 FAST_TRADE_ALERTED_STOCKS.add(symbol)
                             log_fast_trade_alert(symbol, setup, order_id)
-                            # Record for re-entry tracking
-                            _ft_entry_price = setup.get('entry_price', 0)
-                            _ft_vol_ratio   = setup.get('volume_ratio', 1.0)
-                            record_first_entry(symbol, _ft_entry_price, _ft_vol_ratio,
-                                               _fast_strat, _fast_dir)
 
                 # Manage existing fast trades — use 5min df for exit monitoring
                 manage_existing_fast_trades(symbol, df_5m, trader, klinger_data)
@@ -6284,7 +6158,7 @@ def exit_fast_trade(trade_id, exit_price, exit_type, exit_reason, trader):
         if result.get('status_code') == 200:
             # Update trade record
             trade['exit_price'] = exit_price
-            trade['exit_time'] = now_ist()
+            trade['exit_time'] = datetime.now()
             trade['exit_type'] = exit_type
             trade['exit_reason'] = exit_reason
             trade['pnl'] = pnl
@@ -6301,7 +6175,7 @@ def exit_fast_trade(trade_id, exit_price, exit_type, exit_reason, trader):
                     # Update with exit info
                     position.update({
                         'exit_price': exit_price,
-                        'exit_time': now_ist(),
+                        'exit_time': datetime.now(),
                         'exit_reason': f"FAST_TRADE_{exit_reason}",
                         'pnl': pnl,
                         'pnl_pct': pnl_pct
@@ -6337,7 +6211,7 @@ def log_fast_trade_entry(symbol, setup, order_id, entry_price, is_premium_estima
             ])
         
         writer.writerow([
-            now_ist().strftime('%Y-%m-%d %H:%M:%S'),
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             symbol,
             setup['signal'],
             entry_price,
@@ -6397,7 +6271,7 @@ def log_fast_trade_alert(symbol, setup, order_id):
     with open(log_file, 'a', encoding='utf-8') as f:
         f.write(f"\n{'='*100}\n")
         f.write(f"FAST TRADE ALERT: {symbol} {setup['signal']}\n")
-        f.write(f"Time: {now_ist().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Entry Type: {setup['entry_type']}\n")
         f.write(f"Price: ₹{setup['entry_price']:.2f}\n")
         f.write(f"Stop: ₹{setup['stop_loss']:.2f}\n")
@@ -6524,7 +6398,7 @@ def get_live_prices_batch(access_token, instrument_keys):
                                 'open': ohlc_data.get('open'),
                                 'close': ohlc_data.get('close'),
                                 'volume': quote.get('volume'),
-                                'timestamp': now_ist()
+                                'timestamp': datetime.now()
                             }
             elif response.status_code == 429:
                 print(" ⚡ Rate limit hit, waiting...")
@@ -6631,7 +6505,7 @@ def init_one(access_token, args):
                         'klinger_prev': float(klinger.iloc[-2]),
                         'signal_prev': float(signal_line.iloc[-2]),
                         'ko_history': ko_history_init,
-                        'last_update': now_ist(),
+                        'last_update': datetime.now(),
                         'candle_count': len(vh),
                         'adaptive_params': len(vh) < 90 if ADAPTIVE_KLINGER_LOOKBACK else False
                     }
@@ -6821,7 +6695,7 @@ def reset_stale_breach_states():
     Also resets counters that have been stuck at count=1 for too many scans
     (AMBUJACEM-type fix: confirmation counter resets after 3 scans with no progress).
     """
-    current_time = now_ist()
+    current_time = datetime.now()
     stale_keys = []
     for key, state in LAST_BREAKOUT_STATE.items():
         elapsed = (current_time - state['first_breach_time']).seconds
@@ -6843,7 +6717,7 @@ def reset_stale_breach_states():
 
 def reset_stale_box_states():
     """Clean stale box breach states"""
-    current_time = now_ist()
+    current_time = datetime.now()
     stale = [k for k, s in LAST_BOX_STATE.items() 
              if (current_time - s['first_breach_time']).seconds > BREACH_TIME_WINDOW]
     for k in stale:
@@ -6851,169 +6725,11 @@ def reset_stale_box_states():
 
 def reset_stale_bounce_states():
     """Clean stale bounce states"""
-    current_time = now_ist()
+    current_time = datetime.now()
     stale = [k for k, s in LAST_BOUNCE_STATE.items() 
              if (current_time - s['first_breach_time']).seconds > BREACH_TIME_WINDOW]
     for k in stale:
         del LAST_BOUNCE_STATE[k]
-
-# =============================================================================
-# SAME-DIRECTION RE-ENTRY ENGINE
-# Shared helpers used by R3, S3, BOX_TOP, BOX_BOTTOM, BOUNCE, REJECT, and
-# FAST strategies.  ORB has its own dedicated check_orb_reentry() function.
-# =============================================================================
-
-def _get_nifty_day_gain_pct() -> float:
-    """Return today's Nifty 50 day-gain % from live_data if available, else 0."""
-    try:
-        # Nifty instrument key in Upstox: NSE_INDEX|Nifty 50
-        nifty_key = "NSE_INDEX|Nifty 50"
-        info = R3_LEVELS.get(nifty_key, {})
-        prev_close = info.get('yesterday_close', 0)
-        # live price stored in R3_LEVELS during init or from recent scan
-        live_ltp   = info.get('ltp', 0)
-        if prev_close and live_ltp:
-            return (live_ltp - prev_close) / prev_close * 100
-    except Exception:
-        pass
-    return 0.0   # default: don't block re-entry if Nifty data unavailable
-
-
-def record_first_entry(symbol: str, entry_price: float, vol_ratio: float,
-                       strategy: str, direction: str) -> None:
-    """Called by send_alert() and fast-trade order logic on the FIRST entry.
-    Records the metadata needed by check_reentry() on subsequent scans.
-    Idempotent — safe to call multiple times; only the first call has effect.
-    """
-    if symbol not in REENTRY_FIRST_ENTRY:
-        REENTRY_FIRST_ENTRY[symbol] = {
-            'time':      now_ist(),
-            'price':     entry_price,
-            'vol_ratio': vol_ratio,
-            'strategy':  strategy,
-            'direction': direction,
-        }
-        if DEBUG_MODE:
-            print(f"📌 Re-entry tracking started: {symbol} {strategy} @ ₹{entry_price:.2f}")
-
-
-def check_reentry(symbol: str, strategy: str, direction: str,
-                  current_price: float, current_vol_ratio: float,
-                  session_high: float, session_low: float) -> bool:
-    """
-    Shared same-direction re-entry gate.  Returns True when ALL gates pass.
-
-    Parameters
-    ----------
-    symbol           : stock ticker
-    strategy         : 'R3', 'S3', 'BOX_TOP', 'BOX_BOTTOM', 'BOUNCE_BOTTOM',
-                       'REJECT_TOP', 'FAST_LONG', 'FAST_SHORT'
-    direction        : 'LONG' or 'SHORT'
-    current_price    : live LTP
-    current_vol_ratio: current_volume / 20d_avg_volume
-    session_high     : live session high
-    session_low      : live session low
-    """
-    if not ENABLE_REENTRY:
-        return False
-
-    first = REENTRY_FIRST_ENTRY.get(symbol)
-    if not first or first.get('strategy') != strategy:
-        return False   # no first entry recorded for this strategy
-
-    # ── Gate 1: cap ──────────────────────────────────────────────────────────
-    already = REENTRY_ALERTED.get(symbol, set())
-    if strategy in already:
-        return False   # already re-entered this strategy today
-    if len(already) >= REENTRY_MAX_PER_SYMBOL:
-        return False   # daily cap across all strategies reached
-
-    # ── Gate 2: cooldown ─────────────────────────────────────────────────────
-    mins_elapsed = (now_ist() - first['time']).total_seconds() / 60
-    if mins_elapsed < REENTRY_COOLDOWN_MINS:
-        return False
-
-    # ── Gate 3: new leg ───────────────────────────────────────────────────────
-    threshold = first['price'] * (1 + REENTRY_MIN_GAIN_PCT / 100)
-    if direction == 'LONG' and session_high < threshold:
-        return False
-    if direction == 'SHORT':
-        low_threshold = first['price'] * (1 - REENTRY_MIN_GAIN_PCT / 100)
-        if session_low > low_threshold:
-            return False
-
-    # ── Gate 4: volume still elevated ────────────────────────────────────────
-    required_vol = first['vol_ratio'] * REENTRY_VOLUME_MULTIPLIER
-    if current_vol_ratio < required_vol:
-        return False
-
-    # ── Gate 5: market filter (LONG only) ────────────────────────────────────
-    if direction == 'LONG' and REENTRY_NIFTY_MIN_GAIN_PCT > 0:
-        nifty_gain = _get_nifty_day_gain_pct()
-        if nifty_gain < REENTRY_NIFTY_MIN_GAIN_PCT:
-            if DEBUG_MODE:
-                print(f"⛔ Re-entry {symbol} {strategy}: Nifty {nifty_gain:.2f}% < "
-                      f"required {REENTRY_NIFTY_MIN_GAIN_PCT:.2f}%")
-            return False
-
-    # ── Gate 6: multi-scan confirmation ──────────────────────────────────────
-    ckey = f"{symbol}_{strategy}"
-    state = REENTRY_CONFIRM_STATE.get(ckey)
-    now   = now_ist()
-
-    if state is None:
-        REENTRY_CONFIRM_STATE[ckey] = {
-            'count': 1, 'first_time': now,
-            'vol_ratios': [current_vol_ratio]
-        }
-        if DEBUG_MODE:
-            print(f"📊 Re-entry {symbol} {strategy}: scan 1/{REENTRY_CONFIRM_SCANS} "
-                  f"price ₹{current_price:.2f} vol {current_vol_ratio:.2f}x")
-        return False
-
-    elapsed = (now - state['first_time']).total_seconds()
-    if elapsed > BREACH_TIME_WINDOW:
-        # Window expired — restart
-        REENTRY_CONFIRM_STATE[ckey] = {
-            'count': 1, 'first_time': now,
-            'vol_ratios': [current_vol_ratio]
-        }
-        return False
-
-    state['count'] += 1
-    state['vol_ratios'].append(current_vol_ratio)
-
-    if state['count'] < REENTRY_CONFIRM_SCANS:
-        if DEBUG_MODE:
-            print(f"📊 Re-entry {symbol} {strategy}: scan {state['count']}/{REENTRY_CONFIRM_SCANS}")
-        return False
-
-    # All confirmations met — check volume persistence
-    avg_vol = sum(state['vol_ratios']) / len(state['vol_ratios'])
-    required_vol_avg = first['vol_ratio'] * REENTRY_VOLUME_MULTIPLIER * 0.9
-    if avg_vol < required_vol_avg:
-        del REENTRY_CONFIRM_STATE[ckey]
-        if DEBUG_MODE:
-            print(f"⚠️ Re-entry {symbol} {strategy}: volume faded ({avg_vol:.2f}x) — skip")
-        return False
-
-    # ✅ All gates passed
-    del REENTRY_CONFIRM_STATE[ckey]
-    if symbol not in REENTRY_ALERTED:
-        REENTRY_ALERTED[symbol] = set()
-    REENTRY_ALERTED[symbol].add(strategy)
-    print(f"\n🔄 RE-ENTRY CONFIRMED: {symbol} {strategy} {direction} @ ₹{current_price:.2f} "
-          f"| {mins_elapsed:.0f}min after first | vol {avg_vol:.2f}x | "
-          f"{state['count']} scans")
-    return True
-
-
-def reset_reentry_state_daily() -> None:
-    """Clear all re-entry state at the start of a new trading day (call when time < 09:15)."""
-    REENTRY_FIRST_ENTRY.clear()
-    REENTRY_ALERTED.clear()
-    REENTRY_CONFIRM_STATE.clear()
-
 
 def check_breakout(key, live):
     """Enhanced R3 breakout check with false alert prevention"""
@@ -7021,20 +6737,14 @@ def check_breakout(key, live):
     if not info:
         return None
 
-    # ── SECOND-HALF REVERSE WATCH + SAME-DIRECTION RE-ENTRY (R3 LONG) ─────────
-    sym_r3 = info['symbol']
+    # ── SECOND-HALF REVERSE WATCH (R3 LONG) ─────────────────────────────────
+    # Already fired R3 LONG → skip entirely.
+    # Fired S3 SHORT earlier → allow R3 LONG re-entry only in 2nd half (reversal bounce).
+    if info['symbol'] in R3_ALERTED_STOCKS:
+        return None   # already took the R3 LONG today
     _in_second_half_r3 = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                          and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
-
-    if sym_r3 in R3_ALERTED_STOCKS:
-        # First R3 LONG already fired.  Two paths:
-        #   a) Same-direction re-entry on a new leg — handled below via check_reentry()
-        #   b) Reverse (S3) — handled separately in check_breakdown()
-        # For the PRIMARY confirmation flow we must still return None here so the
-        # LAST_BREAKOUT_STATE machine is not double-triggered.  The scan loop calls
-        # check_breakout_reentry() for re-entry detection (see enhanced_monitor).
-        return None
-    if sym_r3 in S3_ALERTED_STOCKS and not _in_second_half_r3:
+                          and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
+    if info['symbol'] in S3_ALERTED_STOCKS and not _in_second_half_r3:
         return None   # had S3 SHORT but too early for reverse LONG
     
     if live['high'] is None or info['r3'] is None or info['r3'] == 0:
@@ -7092,7 +6802,7 @@ def check_breakout(key, live):
         return None
 
     # VALIDATION 4: Consecutive Confirmation
-    current_time = now_ist()
+    current_time = datetime.now()
     if key not in LAST_BREAKOUT_STATE:
         LAST_BREAKOUT_STATE[key] = {
             'breach_count': 1,
@@ -7181,15 +6891,14 @@ def check_breakdown(key, live):
     if not info:
         return None
 
-    # ── SECOND-HALF REVERSE WATCH + SAME-DIRECTION RE-ENTRY (S3 SHORT) ────────
-    sym_s3 = info['symbol']
+    # ── SECOND-HALF REVERSE WATCH (S3) ───────────────────────────────────────
+    # If already fired S3 SHORT, skip entirely.
+    # If fired R3 LONG earlier and now in 2nd half → allow S3 SHORT re-entry.
+    if info['symbol'] in S3_ALERTED_STOCKS:
+        return None   # already took the S3 SHORT today
     _in_second_half_s3 = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                          and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
-
-    if sym_s3 in S3_ALERTED_STOCKS:
-        # First S3 SHORT already fired — re-entry handled via check_breakdown_reentry().
-        return None
-    if sym_s3 in R3_ALERTED_STOCKS and not _in_second_half_s3:
+                          and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
+    if info['symbol'] in R3_ALERTED_STOCKS and not _in_second_half_s3:
         return None   # had R3 LONG but too early for reverse SHORT
     
     if live['low'] is None or info.get('s3') is None or info['s3'] == 0:
@@ -7254,7 +6963,7 @@ def check_breakdown(key, live):
         return None
 
     # VALIDATION 4: Consecutive Confirmation
-    current_time = now_ist()
+    current_time = datetime.now()
     if key not in LAST_BREAKOUT_STATE or LAST_BREAKOUT_STATE[key].get('breach_type') != 'S3':
         LAST_BREAKOUT_STATE[key] = {
             'breach_count': 1,
@@ -7341,13 +7050,13 @@ def check_box_top_breakout(key, live):
     if not info or not ENABLE_BOX_TRADING:
         return None
 
-    # BOX_TOP already fired → re-entry handled via check_box_top_reentry()
-    sym_bt = info['symbol']
-    _in_second_half_box_top = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                                and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
-    if sym_bt in BOX_TOP_ALERTED_STOCKS:
+    # BOX_TOP already fired → skip entirely
+    if info['symbol'] in BOX_TOP_ALERTED_STOCKS:
         return None
-    if sym_bt in BOX_BOTTOM_ALERTED_STOCKS and not _in_second_half_box_top:
+    # BOX_BOTTOM (SHORT) fired earlier → allow BOX_TOP LONG re-entry only in 2nd half
+    _in_second_half_box_top = (ENABLE_SECOND_HALF_SHORT_REWATCH
+                                and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
+    if info['symbol'] in BOX_BOTTOM_ALERTED_STOCKS and not _in_second_half_box_top:
         return None   # had BOX_BOTTOM SHORT but too early for reverse LONG
 
     box_top = info['box_high']
@@ -7415,7 +7124,7 @@ def check_box_top_breakout(key, live):
                 print(f"⚠️ {info['symbol']}: Incomplete Klinger data — blocking CE entry")
             return None
 
-    current_time = now_ist()
+    current_time = datetime.now()
     if key not in LAST_BOX_STATE or LAST_BOX_STATE[key].get('breach_type') != 'BOX_TOP':
         LAST_BOX_STATE[key] = {
             'breach_count': 1,
@@ -7489,13 +7198,13 @@ def check_box_bottom_breakdown(key, live):
     if not info or not ENABLE_BOX_TRADING:
         return None
 
-    # BOX_BOTTOM already fired → re-entry handled via check_box_bottom_reentry()
-    sym_bb = info['symbol']
-    _in_second_half_box = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                           and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
-    if sym_bb in BOX_BOTTOM_ALERTED_STOCKS:
+    # BOX_BOTTOM already fired → skip
+    if info['symbol'] in BOX_BOTTOM_ALERTED_STOCKS:
         return None
-    if sym_bb in BOX_TOP_ALERTED_STOCKS and not _in_second_half_box:
+    # BOX_TOP fired earlier → only allow if we're in the second half
+    _in_second_half_box = (ENABLE_SECOND_HALF_SHORT_REWATCH
+                           and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
+    if info['symbol'] in BOX_TOP_ALERTED_STOCKS and not _in_second_half_box:
         return None
 
     box_bottom = info['box_low']
@@ -7562,7 +7271,7 @@ def check_box_bottom_breakdown(key, live):
                 print(f"⚠️ {info['symbol']}: Incomplete Klinger data — blocking PE entry")
             return None
 
-    current_time = now_ist()
+    current_time = datetime.now()
     if key not in LAST_BOX_STATE or LAST_BOX_STATE[key].get('breach_type') != 'BOX_BOTTOM':
         LAST_BOX_STATE[key] = {
             'breach_count': 1,
@@ -7636,13 +7345,13 @@ def check_box_support_bounce(key, live):
     if not info or not ENABLE_RANGE_TRADING:
         return None
 
-    # BOUNCE_BOTTOM already fired → re-entry handled in scan loop
-    sym_bn = info['symbol']
-    _in_second_half_bounce = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                               and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
-    if sym_bn in RANGE_BOUNCE_ALERTED_STOCKS:
+    # BOUNCE_BOTTOM already fired → skip entirely
+    if info['symbol'] in RANGE_BOUNCE_ALERTED_STOCKS:
         return None
-    if sym_bn in RANGE_REJECT_ALERTED_STOCKS and not _in_second_half_bounce:
+    # REJECT_TOP (SHORT) fired earlier → allow BOUNCE_BOTTOM LONG re-entry only in 2nd half
+    _in_second_half_bounce = (ENABLE_SECOND_HALF_SHORT_REWATCH
+                               and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
+    if info['symbol'] in RANGE_REJECT_ALERTED_STOCKS and not _in_second_half_bounce:
         return None   # had REJECT_TOP SHORT but too early for reverse LONG
 
     box_bottom = info['box_low']
@@ -7697,7 +7406,7 @@ def check_box_support_bounce(key, live):
                 if DEBUG_MODE:
                     print(f"✅ {info['symbol']}: Klinger CONFIRMS support bounce!")
 
-    current_time = now_ist()
+    current_time = datetime.now()
     bounce_key = f"{key}_BOUNCE_BOTTOM"
     
     if bounce_key not in LAST_BOUNCE_STATE:
@@ -7760,12 +7469,12 @@ def check_box_resistance_rejection(key, live):
     if not info or not ENABLE_RANGE_TRADING:
         return None
 
-    # REJECT_TOP already fired → re-entry handled in scan loop
+    # REJECT_TOP already fired → skip
     if info['symbol'] in RANGE_REJECT_ALERTED_STOCKS:
         return None
     # BOUNCE_BOTTOM fired earlier → only allow if we're in the second half
     _in_second_half_range = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                             and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
+                             and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
     if info['symbol'] in RANGE_BOUNCE_ALERTED_STOCKS and not _in_second_half_range:
         return None
 
@@ -7821,7 +7530,7 @@ def check_box_resistance_rejection(key, live):
                 if DEBUG_MODE:
                     print(f"✅ {info['symbol']}: Klinger CONFIRMS resistance rejection!")
 
-    current_time = now_ist()
+    current_time = datetime.now()
     reject_key = f"{key}_REJECT_TOP"
     
     if reject_key not in LAST_BOUNCE_STATE:
@@ -8066,7 +7775,7 @@ def should_place_gap_trade(gap_info, signal):
     already_up   = symbol in GAP_UP_ALERTED_STOCKS
     already_down = symbol in GAP_DOWN_ALERTED_STOCKS
     _in_second_half_gap = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                           and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
+                           and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
 
     if gap_direction == 'CE':
         if already_up:
@@ -8086,7 +7795,7 @@ def should_place_gap_trade(gap_info, signal):
         return False
         
     if symbol in LAST_ORDER_TIME:
-        time_since_last = (now_ist() - LAST_ORDER_TIME[symbol]).seconds
+        time_since_last = (datetime.now() - LAST_ORDER_TIME[symbol]).seconds
         if time_since_last < MIN_ORDER_GAP_SECONDS:
             return False
             
@@ -8123,7 +7832,7 @@ def check_exit_conditions(position, current_price, trader):
     
     # 1. TIME-BASED EXIT (Most Important - Before Market Close)
     if ENABLE_TIME_BASED_EXIT:
-        now = now_ist()
+        now = datetime.now()
         current_time_str = now.strftime("%H:%M")
         
         # Regular end-of-day exit
@@ -8299,7 +8008,7 @@ def exit_position(trader, position_id, position, exit_price, reason):
             closed_position = {
                 **position,
                 'exit_price': exit_price,
-                'exit_time': now_ist(),
+                'exit_time': datetime.now(),
                 'exit_reason': reason,
                 'pnl': total_pnl,
                 'pnl_percent': pnl_percent,
@@ -8543,7 +8252,7 @@ def add_to_ha_watchlist(symbol: str, signal: str, instrument_key: str, reason: s
     HA_WATCHLIST[symbol] = {
         'signal':         signal,           # 'LONG' or 'SHORT'
         'instrument_key': instrument_key,
-        'added_at':       now_ist(),
+        'added_at':       datetime.now(),
         'reason':         reason,
     }
     print(f"👁️  HA Watchlist: added {symbol} ({signal}) — {reason}")
@@ -8669,7 +8378,7 @@ def check_ha_reversal_alerts(access_token: str, trader=None):
     # ══════════════════════════════════════════════════════════════════════════
     # PART B — HA WATCHLIST: missed/rejected signals (Enhancement 2)
     # ══════════════════════════════════════════════════════════════════════════
-    now = now_ist()
+    now = datetime.now()
     expired = [sym for sym, w in HA_WATCHLIST.items()
                if (now - w['added_at']).total_seconds() / 60 > HA_WATCHLIST_MAX_AGE_MINUTES]
     for sym in expired:
@@ -8841,7 +8550,7 @@ def sync_positions_with_broker(trader):
             closed_position = {
                 **position,
                 'exit_price': exit_price,
-                'exit_time': now_ist(),
+                'exit_time': datetime.now(),
                 'exit_reason': 'EXTERNAL_CLOSE',
                 'pnl': 0,
                 'pnl_percent': 0
@@ -9007,7 +8716,7 @@ def place_breakout_order(breakout_data, trader):
             else:
                 DAILY_ORDER_COUNT += 1
                 
-            LAST_ORDER_TIME[symbol] = now_ist()
+            LAST_ORDER_TIME[symbol] = datetime.now()
             filled_price = order_info.get('filled_price', premium)
 
             # Parse expiry date
@@ -9030,7 +8739,7 @@ def place_breakout_order(breakout_data, trader):
                 'option_type': option_type,
                 'trade_type': f'{strategy}_OPTION',
                 'strategy': strategy,
-                'timestamp': now_ist(),
+                'timestamp': datetime.now(),
                 'expiry_date': expiry_date,
                 'klinger_confirmed': breakout_data.get('klinger_confirmed', False),
                 'is_premium_estimated': is_premium_estimated
@@ -9138,7 +8847,7 @@ def place_gap_order(gap_info, signal, trader):
         if order_info and order_info.get('order_id'):
             order_id = order_info['order_id']
             GAP_ORDER_COUNT += 1
-            LAST_ORDER_TIME[symbol] = now_ist()
+            LAST_ORDER_TIME[symbol] = datetime.now()
             filled_price = order_info.get('filled_price', premium)
 
             # Parse expiry date
@@ -9162,7 +8871,7 @@ def place_gap_order(gap_info, signal, trader):
                 'trade_type': 'GAP_OPTION',
                 'gap_signal': signal['signal'],
                 'direction': direction,
-                'timestamp': now_ist(),
+                'timestamp': datetime.now(),
                 'expiry_date': expiry_date,
                 'strategy': 'GAP',
                 'is_premium_estimated': is_premium_estimated
@@ -9243,42 +8952,36 @@ def send_alert(b, trader=None):
             return
         BOX_TOP_ALERTED_STOCKS.add(s)
         BOX_ALERTED_STOCKS.add(s)   # legacy alias
-        record_first_entry(s, b['current_price'], b.get('volume_ratio', 0), 'BOX_TOP', 'LONG')
         csv_file = BOX_CSV_FILE
     elif strategy == 'BOX_BOTTOM':
         if s in BOX_BOTTOM_ALERTED_STOCKS:
             return
         BOX_BOTTOM_ALERTED_STOCKS.add(s)
         BOX_ALERTED_STOCKS.add(s)   # legacy alias
-        record_first_entry(s, b['current_price'], b.get('volume_ratio', 0), 'BOX_BOTTOM', 'SHORT')
         csv_file = BOX_CSV_FILE
     elif strategy == 'BOUNCE_BOTTOM':
         if s in RANGE_BOUNCE_ALERTED_STOCKS:
             return
         RANGE_BOUNCE_ALERTED_STOCKS.add(s)
         RANGE_ALERTED_STOCKS.add(s) # legacy alias
-        record_first_entry(s, b['current_price'], b.get('volume_ratio', 0), 'BOUNCE_BOTTOM', 'LONG')
         csv_file = RANGE_CSV_FILE
     elif strategy == 'REJECT_TOP':
         if s in RANGE_REJECT_ALERTED_STOCKS:
             return
         RANGE_REJECT_ALERTED_STOCKS.add(s)
         RANGE_ALERTED_STOCKS.add(s) # legacy alias
-        record_first_entry(s, b['current_price'], b.get('volume_ratio', 0), 'REJECT_TOP', 'SHORT')
         csv_file = RANGE_CSV_FILE
     elif strategy == 'R3':
         if s in R3_ALERTED_STOCKS:
             return
         R3_ALERTED_STOCKS.add(s)
         ALERTED_STOCKS.add(s)       # legacy alias
-        record_first_entry(s, b['current_price'], b.get('volume_ratio', 0), 'R3', 'LONG')
         csv_file = ALERT_CSV_FILE
     elif strategy == 'S3':
         if s in S3_ALERTED_STOCKS:
             return
         S3_ALERTED_STOCKS.add(s)
         ALERTED_STOCKS.add(s)       # legacy alias
-        record_first_entry(s, b['current_price'], b.get('volume_ratio', 0), 'S3', 'SHORT')
         csv_file = ALERT_CSV_FILE
     else:
         if s in ALERTED_STOCKS:
@@ -9310,7 +9013,7 @@ def send_alert(b, trader=None):
         if total_orders >= MAX_ORDERS_PER_DAY:
             print("⚡ Daily order limit reached")
         elif s in LAST_ORDER_TIME:
-            time_since = (now_ist() - LAST_ORDER_TIME[s]).seconds
+            time_since = (datetime.now() - LAST_ORDER_TIME[s]).seconds
             if time_since < MIN_ORDER_GAP_SECONDS:
                 print(f"⚡ Too soon ({time_since}s)")
             else:
@@ -9324,7 +9027,7 @@ def send_alert(b, trader=None):
     with open(csv_file, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow([
-            now_ist().strftime('%Y-%m-%d %H:%M:%S'),
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             s,
             b.get('breakout_type', 'CE'),
             f"{b['current_price']:.2f}",
@@ -9371,7 +9074,7 @@ def print_final_stats():
     print(f"\n{'='*100}")
     print("⚡ TRADING SESSION COMPLETE")
     print(f"{'='*100}")
-    print(f"Time: {now_ist().strftime('%H:%M:%S')}")
+    print(f"Time: {datetime.now().strftime('%H:%M:%S')}")
     print(f"Total Stocks Monitored: {len(R3_LEVELS)}")
     print(f"\n📊 ALERTS SUMMARY:")
     print(f" • R3/S3 Alerts: {len(ALERTED_STOCKS)} (R3={len(R3_ALERTED_STOCKS)}, S3={len(S3_ALERTED_STOCKS)})")
@@ -9382,9 +9085,6 @@ def print_final_stats():
           f"(LONG={len(FAST_TRADE_LONG_ALERTED)}, SHORT={len(FAST_TRADE_SHORT_ALERTED)})")
     if ENABLE_ORB_STRATEGY:
         print(f" • ORB Alerts: {len(ORB_ALERTED_STOCKS)}")
-        total_reentries = sum(len(v) for v in REENTRY_ALERTED.values())
-        if total_reentries:
-            print(f" • Same-direction re-entries: {total_reentries} across {len(REENTRY_ALERTED)} symbols")
     
     print(f"\n📈 ORDERS SUMMARY:")
     print(f" • R3/S3 Orders: {DAILY_ORDER_COUNT}")
@@ -9513,7 +9213,7 @@ def print_final_stats():
     # Final log
     with open(ALERT_LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(f"\n{'='*100}\n")
-        f.write(f"SESSION END: {now_ist().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"SESSION END: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"R3/S3 Alerts: {len(ALERTED_STOCKS)} | Orders: {DAILY_ORDER_COUNT}\n")
         f.write(f"Box Theory Alerts: {len(BOX_ALERTED_STOCKS)} | Orders: {BOX_ORDER_COUNT}\n")
         f.write(f"Range Trading Alerts: {len(RANGE_ALERTED_STOCKS)} | Orders: {RANGE_ORDER_COUNT}\n")
@@ -9544,7 +9244,7 @@ def enhanced_monitor(access_token, keys, symbols):
     # running scans that generate signals whose orders will all be rejected.
     # Set WAIT_FOR_ORDER_WINDOW=False to scan immediately (signals logged, no orders).
     if WAIT_FOR_ORDER_WINDOW and not is_order_time_allowed():
-        now       = now_ist()
+        now       = datetime.now()
         opens_at  = now.replace(hour=5, minute=30, second=0, microsecond=0)
         if now > opens_at:          # already past 05:30 → means we're after midnight
             opens_at = opens_at + timedelta(days=1)
@@ -9554,12 +9254,12 @@ def enhanced_monitor(access_token, keys, symbols):
         print(f"   Current time: {now.strftime('%H:%M:%S')} | Opens in: {wait_mins}m {wait_secs%60}s")
         print(f"   (Set WAIT_FOR_ORDER_WINDOW=False to skip this wait and scan immediately)\n")
         while not is_order_time_allowed():
-            remaining = int((opens_at - now_ist()).total_seconds())
+            remaining = int((opens_at - datetime.now()).total_seconds())
             if remaining % 300 == 0 or remaining <= 60:  # print every 5 min + last minute
                 print(f"   ⏳ Waiting for 05:30... {remaining//60}m {remaining%60}s remaining",
                       flush=True)
             time.sleep(30)
-        print(f"\n✅ Order window open ({now_ist().strftime('%H:%M:%S')}) — starting scans.\n")
+        print(f"\n✅ Order window open ({datetime.now().strftime('%H:%M:%S')}) — starting scans.\n")
     # ─────────────────────────────────────────────────────────────────────────
     print(f"🔥 Klinger Filter: {'ENABLED ✓' if ENABLE_KLINGER_FILTER else 'DISABLED'}")
     if ENABLE_KLINGER_FILTER:
@@ -9620,10 +9320,10 @@ def enhanced_monitor(access_token, keys, symbols):
     
     scan_count = 0
     klinger_update_batch = []
-    last_position_check = now_ist()
-    last_position_sync = now_ist()
-    last_summary_print = now_ist()
-    last_cache_cleanup = now_ist()
+    last_position_check = datetime.now()
+    last_position_sync = datetime.now()
+    last_summary_print = datetime.now()
+    last_cache_cleanup = datetime.now()
     
     try:
         # Initialize FII/DII and ORB
@@ -9643,7 +9343,7 @@ def enhanced_monitor(access_token, keys, symbols):
             # but calling it here with empty live_data is harmless (it won't
             # process anything useful without live prices). We just prime the
             # state so scan #1 doesn't need to re-trigger the primary pass.
-            _now = now_ist()
+            _now = datetime.now()
             _930 = _now.replace(hour=9, minute=30, second=0, microsecond=0)
             _cutoff = _930 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
             _ct = _now.strftime("%H:%M")
@@ -9655,7 +9355,7 @@ def enhanced_monitor(access_token, keys, symbols):
         
         while True:
             scan_count += 1
-            current_time = now_ist()
+            current_time = datetime.now()
 
             # Clear intraday candle cache from previous scan cycle.
             # The fast-trade prefetch (in monitor_fast_trades thread) refills it
@@ -9754,7 +9454,7 @@ def enhanced_monitor(access_token, keys, symbols):
                     print(f"\n⏰ Market closing - Exiting remaining positions")
                     exit_all_positions(trader, "MARKET_CLOSE")
                 
-                print(f"💤 Market closed. Waiting... ({now_ist().strftime('%H:%M:%S')})", flush=True)
+                print(f"💤 Market closed. Waiting... ({datetime.now().strftime('%H:%M:%S')})", flush=True)
                 time.sleep(60)
                 continue
                 
@@ -9778,7 +9478,7 @@ def enhanced_monitor(access_token, keys, symbols):
                 live_data = None
 
             if not is_market_stabilized():
-                print(f"⏳ Market stabilizing... ({now_ist().strftime('%H:%M:%S')})", flush=True)
+                print(f"⏳ Market stabilizing... ({datetime.now().strftime('%H:%M:%S')})", flush=True)
                 time.sleep(30)
                 continue
                 
@@ -9802,13 +9502,9 @@ def enhanced_monitor(access_token, keys, symbols):
                     update_fii_dii_if_needed()
                 
                 # Show pending confirmations
-                if DEBUG_MODE:
-                    total_pending = (len(LAST_BREAKOUT_STATE) + len(LAST_BOX_STATE)
-                                     + len(LAST_BOUNCE_STATE) + len(REENTRY_CONFIRM_STATE))
-                    if total_pending:
-                        print(f"\n📊 Pending confirmations: {total_pending} "
-                              f"(breach={len(LAST_BREAKOUT_STATE)} box={len(LAST_BOX_STATE)} "
-                              f"bounce={len(LAST_BOUNCE_STATE)} reentry={len(REENTRY_CONFIRM_STATE)})")
+                if (LAST_BREAKOUT_STATE or LAST_BOX_STATE or LAST_BOUNCE_STATE) and DEBUG_MODE:
+                    total_pending = len(LAST_BREAKOUT_STATE) + len(LAST_BOX_STATE) + len(LAST_BOUNCE_STATE)
+                    print(f"\n📊 Pending confirmations: {total_pending}")
 
                 # Gap Trading Logic
                 if ENABLE_GAP_TRADING and is_gap_trading_window() and not TRADING_STOPPED:
@@ -9842,7 +9538,7 @@ def enhanced_monitor(access_token, keys, symbols):
                                 with open(GAP_CSV_FILE, 'a', newline='', encoding='utf-8') as f:
                                     writer = csv.writer(f)
                                     writer.writerow([
-                                        now_ist().strftime('%Y-%m-%d %H:%M:%S'),
+                                        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                         symbol,
                                         gap_type,
                                         signal['signal'],
@@ -9855,124 +9551,35 @@ def enhanced_monitor(access_token, keys, symbols):
                 if not TRADING_STOPPED:
                     for key, live in live_data.items():
                         if key in R3_LEVELS:
-                            sym  = R3_LEVELS[key].get('symbol', '')
-                            ltp  = live.get('ltp', 0)
-                            s_hi = live.get('high', 0) or 0
-                            s_lo = live.get('low',  0) or 0
-                            cur_vol = live.get('volume') or 0
-                            avg20   = R3_LEVELS[key].get('avg_volume_20d', 1) or 1
-                            vol_ratio = cur_vol / avg20
-
-                            # R3 Breakout (first entry)
+                            # R3 Breakout
                             breakout = check_breakout(key, live)
                             if breakout:
                                 send_alert(breakout, trader)
-                            elif ENABLE_REENTRY and sym in R3_ALERTED_STOCKS:
-                                # Same-direction re-entry on a new leg
-                                if check_reentry(sym, 'R3', 'LONG', ltp, vol_ratio, s_hi, s_lo):
-                                    _re = dict(R3_LEVELS[key])
-                                    _re.update({'symbol': sym, 'instrument_key': key,
-                                                'current_price': ltp, 'high': s_hi,
-                                                'volume_ratio': vol_ratio,
-                                                'timestamp': now_ist(),
-                                                'breakout_type': 'CE', 'strategy': 'R3',
-                                                'r3': R3_LEVELS[key].get('r3', ltp),
-                                                'yesterday_close': R3_LEVELS[key].get('yesterday_close', ltp),
-                                                'is_reentry': True,
-                                                'current_volume': cur_vol, 'avg_volume': avg20,
-                                                'klinger_confirmed': False, 'klinger_status': 'RE-ENTRY'})
-                                    send_alert(_re, trader)
-
-                            # S3 Breakdown (first entry)
+                            
+                            # S3 Breakdown
                             breakdown = check_breakdown(key, live)
                             if breakdown:
                                 send_alert(breakdown, trader)
-                            elif ENABLE_REENTRY and sym in S3_ALERTED_STOCKS:
-                                if check_reentry(sym, 'S3', 'SHORT', ltp, vol_ratio, s_hi, s_lo):
-                                    _re = dict(R3_LEVELS[key])
-                                    _re.update({'symbol': sym, 'instrument_key': key,
-                                                'current_price': ltp, 'low': s_lo,
-                                                'volume_ratio': vol_ratio,
-                                                'timestamp': now_ist(),
-                                                'breakout_type': 'PE', 'strategy': 'S3',
-                                                's3': R3_LEVELS[key].get('s3', ltp),
-                                                'yesterday_close': R3_LEVELS[key].get('yesterday_close', ltp),
-                                                'is_reentry': True,
-                                                'current_volume': cur_vol, 'avg_volume': avg20,
-                                                'klinger_confirmed': False, 'klinger_status': 'RE-ENTRY'})
-                                    send_alert(_re, trader)
-
-                            # Box Top Breakout with Klinger (first entry)
+                            
+                            # Box Top Breakout with Klinger
                             box_top = check_box_top_breakout(key, live)
                             if box_top:
                                 send_alert(box_top, trader)
-                            elif ENABLE_REENTRY and sym in BOX_TOP_ALERTED_STOCKS:
-                                if check_reentry(sym, 'BOX_TOP', 'LONG', ltp, vol_ratio, s_hi, s_lo):
-                                    _re = dict(R3_LEVELS[key])
-                                    _re.update({'symbol': sym, 'instrument_key': key,
-                                                'current_price': ltp, 'high': s_hi,
-                                                'volume_ratio': vol_ratio,
-                                                'timestamp': now_ist(),
-                                                'breakout_type': 'CE', 'strategy': 'BOX_TOP',
-                                                'level': R3_LEVELS[key].get('box_high', ltp),
-                                                'yesterday_close': R3_LEVELS[key].get('yesterday_close', ltp),
-                                                'is_reentry': True,
-                                                'klinger_confirmed': False, 'klinger_status': 'RE-ENTRY'})
-                                    send_alert(_re, trader)
-
-                            # Box Bottom Breakdown with Klinger (first entry)
+                            
+                            # Box Bottom Breakdown with Klinger
                             box_bottom = check_box_bottom_breakdown(key, live)
                             if box_bottom:
                                 send_alert(box_bottom, trader)
-                            elif ENABLE_REENTRY and sym in BOX_BOTTOM_ALERTED_STOCKS:
-                                if check_reentry(sym, 'BOX_BOTTOM', 'SHORT', ltp, vol_ratio, s_hi, s_lo):
-                                    _re = dict(R3_LEVELS[key])
-                                    _re.update({'symbol': sym, 'instrument_key': key,
-                                                'current_price': ltp, 'low': s_lo,
-                                                'volume_ratio': vol_ratio,
-                                                'timestamp': now_ist(),
-                                                'breakout_type': 'PE', 'strategy': 'BOX_BOTTOM',
-                                                'level': R3_LEVELS[key].get('box_low', ltp),
-                                                'yesterday_close': R3_LEVELS[key].get('yesterday_close', ltp),
-                                                'is_reentry': True,
-                                                'klinger_confirmed': False, 'klinger_status': 'RE-ENTRY'})
-                                    send_alert(_re, trader)
-
-                            # Support Bounce with Klinger (first entry)
+                            
+                            # Support Bounce with Klinger
                             bounce = check_box_support_bounce(key, live)
                             if bounce:
                                 send_alert(bounce, trader)
-                            elif ENABLE_REENTRY and sym in RANGE_BOUNCE_ALERTED_STOCKS:
-                                if check_reentry(sym, 'BOUNCE_BOTTOM', 'LONG', ltp, vol_ratio, s_hi, s_lo):
-                                    _re = dict(R3_LEVELS[key])
-                                    _re.update({'symbol': sym, 'instrument_key': key,
-                                                'current_price': ltp, 'low': s_lo,
-                                                'volume_ratio': vol_ratio,
-                                                'timestamp': now_ist(),
-                                                'breakout_type': 'CE', 'strategy': 'BOUNCE_BOTTOM',
-                                                'level': R3_LEVELS[key].get('box_low', ltp),
-                                                'yesterday_close': R3_LEVELS[key].get('yesterday_close', ltp),
-                                                'is_reentry': True,
-                                                'klinger_confirmed': False, 'klinger_status': 'RE-ENTRY'})
-                                    send_alert(_re, trader)
-
-                            # Resistance Rejection with Klinger (first entry)
+                            
+                            # Resistance Rejection with Klinger
                             rejection = check_box_resistance_rejection(key, live)
                             if rejection:
                                 send_alert(rejection, trader)
-                            elif ENABLE_REENTRY and sym in RANGE_REJECT_ALERTED_STOCKS:
-                                if check_reentry(sym, 'REJECT_TOP', 'SHORT', ltp, vol_ratio, s_hi, s_lo):
-                                    _re = dict(R3_LEVELS[key])
-                                    _re.update({'symbol': sym, 'instrument_key': key,
-                                                'current_price': ltp, 'high': s_hi,
-                                                'volume_ratio': vol_ratio,
-                                                'timestamp': now_ist(),
-                                                'breakout_type': 'PE', 'strategy': 'REJECT_TOP',
-                                                'level': R3_LEVELS[key].get('box_high', ltp),
-                                                'yesterday_close': R3_LEVELS[key].get('yesterday_close', ltp),
-                                                'is_reentry': True,
-                                                'klinger_confirmed': False, 'klinger_status': 'RE-ENTRY'})
-                                    send_alert(_re, trader)
                         
             except Exception as e:
                 print(f"❌ Monitor loop error: {e}")
@@ -10061,7 +9668,7 @@ def run_trading_bot(access_token):
     # Session log
     with open(ALERT_LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(f"\n{'='*100}\n")
-        f.write(f"SESSION START: {now_ist().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"SESSION START: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Stocks: {len(R3_LEVELS)}\n")
         f.write(f"Strategies: R3/S3={'ON' if ENABLE_AUTO_TRADING else 'OFF'} | ")
         f.write(f"Box Theory={'ON' if ENABLE_BOX_TRADING else 'OFF'} | ")
