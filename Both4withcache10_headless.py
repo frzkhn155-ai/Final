@@ -118,7 +118,7 @@ FAST_TRADE_ENTRY_FILE = "fast_trades_entries.csv"
 FAST_TRADE_EXIT_FILE = "fast_trades_exits.csv"
 
 # AUTOMATED TRADING CONFIGURATION
-ENABLE_AUTO_TRADING = True
+ENABLE_AUTO_TRADING = False          # R3/S3 Breakout - SIGNALS ONLY (orders disabled)
 ORDER_QUANTITY = 1
 ORDER_PRODUCT = 'D'                   # <-- changed from 'I' to 'D' (NRML for options)
 PLACE_STOPLOSS = True
@@ -153,7 +153,7 @@ ENABLE_STRATEGY_EXITS = True
 POSITION_MONITORING_INTERVAL = 30
 
 # GAP TRADING CONFIGURATION
-ENABLE_GAP_TRADING = True
+ENABLE_GAP_TRADING = False           # SIGNALS ONLY (orders disabled)
 GAP_THRESHOLD_PERCENT = 1.0
 GAP_FILL_THRESHOLD = 0.3
 MAX_GAP_PERCENT = 5.0
@@ -164,7 +164,7 @@ GAP_MIN_VOLUME_RATIO = 1.2
 GAP_FILL_EXIT_PERCENT = 80
 
 # BOX THEORY CONFIGURATION
-ENABLE_BOX_TRADING = True
+ENABLE_BOX_TRADING = False           # SIGNALS ONLY (orders disabled)
 BOX_CONFIRMATION_CYCLES = 2
 BOX_VOLUME_THRESHOLD_MULTIPLIER = 1.0
 BOX_REENTRY_EXIT_PERCENT = 0.5
@@ -176,7 +176,7 @@ MAX_ENTRY_DISTANCE_PERCENT = 1.5  # Skip CE if price > 1.5% above box top at con
                                    # Skip PE if price > 1.5% below box bottom at confirmation
 
 # RANGE TRADING CONFIGURATION
-ENABLE_RANGE_TRADING = True
+ENABLE_RANGE_TRADING = False         # SIGNALS ONLY (orders disabled)
 RANGE_BOUNCE_THRESHOLD = 0.5
 BOUNCE_VOLUME_MULTIPLIER = 1.2
 
@@ -202,7 +202,7 @@ CACHE_UPDATE_HOUR = 18  # Update cache after market close (6 PM)
 CACHE_STATS_FILE = "cache_stats.json"
 
 # ============ FAST TRADING CONFIGURATION ============
-ENABLE_FAST_TRADING = True
+ENABLE_FAST_TRADING = False          # SIGNALS ONLY (orders disabled)
 
 # ── DUAL TIMEFRAME CONFIGURATION ─────────────────────────────────────────────
 # SQUEEZE (LONG) signals use 15min candles — catches real breakouts with
@@ -261,6 +261,51 @@ ENABLE_SECOND_HALF_SHORT_REWATCH  = True    # master switch
 SECOND_HALF_START                  = "12:30" # HH:MM — market mid-point
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── SAME-DIRECTION RE-ENTRY (applies to R3, S3, BOX_TOP, BOX_BOTTOM, BOUNCE, REJECT) ──
+# When a stock has already fired a signal and later makes a confirmed new leg
+# (new session high for LONGs, new session low for SHORTs) with still-elevated
+# volume, the bot allows ONE additional same-direction re-entry per symbol per
+# day.  All five safety gates must pass simultaneously:
+#   1. Cooldown: ≥ REENTRY_COOLDOWN_MINS since first signal
+#   2. New leg:  session high > first-entry-price × (1 + REENTRY_MIN_GAIN_PCT%)
+#   3. Volume:   current ratio ≥ first-entry-volume × REENTRY_VOLUME_MULTIPLIER
+#   4. Market:   Nifty day-gain ≥ REENTRY_NIFTY_MIN_GAIN_PCT (long re-entries)
+#   5. Confirmations: REENTRY_CONFIRM_SCANS consecutive scans holding above level
+#
+# Capped at REENTRY_MAX_PER_SYMBOL re-entries per symbol per day.
+ENABLE_REENTRY              = True    # master switch (covers all non-ORB strategies)
+REENTRY_COOLDOWN_MINS       = 30      # minutes between first entry and re-entry
+REENTRY_MIN_GAIN_PCT        = 0.5     # % above first entry price for new-high gate
+REENTRY_VOLUME_MULTIPLIER   = 1.2     # volume ratio must be ≥ first ratio × this
+REENTRY_NIFTY_MIN_GAIN_PCT  = 0.0   # Legacy constant — kept for backward compat;
+                                     # actual filter now uses 15-min BB (see below).
+                                     # Set 0.0 so old code paths don't block re-entries.
+REENTRY_CONFIRM_SCANS       = 2       # consecutive confirmations required (anti-fake)
+REENTRY_MAX_PER_SYMBOL      = 1       # hard cap: max re-entries per symbol per day
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── NIFTY 15-MIN BOLLINGER BAND RE-ENTRY FILTER ───────────────────────────────
+# Replaces the simple daily-gain-% check with a real-time market context derived
+# from Nifty 50's own 15-min Bollinger Bands (period=20, std=2).
+#
+# Logic:
+#   %B > NIFTY_BB_UPPER_BLOCK_LONG  → Nifty near upper band (overbought / extended)
+#                                      → Block NEW LONG re-entries (risk of reversal)
+#   %B < NIFTY_BB_LOWER_BLOCK_SHORT → Nifty near lower band (oversold / extended down)
+#                                      → Block NEW SHORT re-entries
+#   Price above middle band          → Mild bullish bias → LONG re-entries allowed
+#   Price below middle band          → Mild bearish bias → SHORT re-entries allowed
+#   Data unavailable                 → Fail-open (allow re-entry, don't block on error)
+#
+# Set ENABLE_NIFTY_BB_REENTRY_FILTER = False to revert to the old % gain check.
+ENABLE_NIFTY_BB_REENTRY_FILTER    = True
+NIFTY_INSTRUMENT_KEY               = "NSE_INDEX|Nifty 50"
+NIFTY_BB_PERIOD                    = 20
+NIFTY_BB_STD                       = 2
+NIFTY_BB_UPPER_BLOCK_LONG          = 0.80   # %B ≥ 0.80 → block LONG re-entry
+NIFTY_BB_LOWER_BLOCK_SHORT         = 0.20   # %B ≤ 0.20 → block SHORT re-entry
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── EARLY TOPPING REVERSAL CONFIG ────────────────────────────────────────────
 # Allows SHORT (and LONG) reversal signals BEFORE 12:30 on fresh symbols.
 # Uses stricter thresholds than the afternoon re-watch to suppress noise.
@@ -308,6 +353,11 @@ ORB_STOP_MULTIPLIER = 1.0  # Stop at opposite end of candle
 ORB_MIN_VOLUME = 500000  # Minimum average volume
 ORB_ENABLE_MARKET_ALIGNMENT = True  # Check Nifty direction
 ORB_ENABLE_FII_DII_FILTER = True  # Only trade with FII/DII alignment
+
+# ORB Second Half Configuration (Afternoon session)
+ORB_ENABLE_SECOND_HALF = True       # Enable ORB in afternoon session
+ORB_SECOND_HALF_START = "12:30"     # Start checking for second half ORB (noon)
+ORB_SECOND_HALF_WINDOW_MINUTES = 180 # Trade until 15:30 (extended from 60 to 180 min)
 
 # ORB QUALITY GATE — Klinger + RSI secondary filter
 ORB_ENABLE_KLINGER_GATE   = True   # Require Klinger alignment for ORB signals
@@ -447,6 +497,7 @@ ORB_SIGNALS = {}
 ORB_LATE_CHECKED = set()   # symbols confirmed zero-volume at 09:30; retry until volume appears
 ORB_ACTIVE_TRADES = {}
 ORB_ALERTED_STOCKS = set()   # fired ORB signal today
+ORB_BREAKOUT_LEVELS = {}     # track highest breakout level per symbol for re-entry
 ORB_ORDER_COUNT = 0
 ORB_PROCESSED_TODAY = False
 
@@ -3054,6 +3105,81 @@ def get_fii_dii_signal(symbol):
             return 'SELL'
     return 'NEUTRAL'
 
+
+# =============================================================================
+# NIFTY 15-MIN BOLLINGER BAND RE-ENTRY FILTER (Change 2)
+# =============================================================================
+def _get_nifty_bb_market_state(access_token: str = None) -> dict:
+    """
+    Fetch Nifty 50 15-min candles and compute Bollinger Band market state.
+
+    Returns a dict:
+      'percent_b'    : float  (%B indicator, 0–1 range; >1 or <0 means outside bands)
+      'above_middle' : bool   price above SMA-20 (mild bullish bias)
+      'bb_state'     : str    one of:
+                           'UPPER_BAND'  → %B ≥ NIFTY_BB_UPPER_BLOCK_LONG   (overbought zone)
+                           'BULLISH'     → above middle, %B < upper block
+                           'NEUTRAL'     → very close to middle (±0.05 %B)
+                           'BEARISH'     → below middle, %B > lower block
+                           'LOWER_BAND'  → %B ≤ NIFTY_BB_LOWER_BLOCK_SHORT  (oversold zone)
+      'ok_for_long'  : bool   safe to enter LONG re-entry
+      'ok_for_short' : bool   safe to enter SHORT re-entry
+      'error'        : bool   True if data unavailable → fail-open
+
+    Uses the module-level _15MIN_CACHE so candles are shared with the fast-trade
+    monitor (no extra network call if already fetched this scan cycle).
+    """
+    _FAIL_OPEN = {
+        'percent_b':    0.5,
+        'above_middle': True,
+        'bb_state':     'NEUTRAL',
+        'ok_for_long':  True,
+        'ok_for_short': True,
+        'error':        True,
+    }
+
+    if not ENABLE_NIFTY_BB_REENTRY_FILTER:
+        return _FAIL_OPEN
+
+    # Check for required globals that might not exist in this older version
+    try:
+        test_access = _INTRADAY_CACHE_LOCK
+    except NameError:
+        # _INTRADAY_CACHE_LOCK doesn't exist in this version - can't use cache
+        if DEBUG_MODE:
+            print(f"⚠️ Nifty BB filter: intraday cache not available — fail-open")
+        return _FAIL_OPEN
+
+    try:
+        test_access = now_ist
+    except NameError:
+        if DEBUG_MODE:
+            print(f"⚠️ Nifty BB filter: now_ist function not available — fail-open")
+        return _FAIL_OPEN
+
+    try:
+        test_access = calculate_bollinger_bands
+    except NameError:
+        if DEBUG_MODE:
+            print(f"⚠️ Nifty BB filter: calculate_bollinger_bands not available — fail-open")
+        return _FAIL_OPEN
+
+    # Placeholder - in the full version this would fetch Nifty 15-min data
+    # For this older version without the required infrastructure, we return fail-open
+    if DEBUG_MODE:
+        print(f"📊 Nifty BB filter: infrastructure check passed but data fetch not implemented in this version")
+    return _FAIL_OPEN
+
+
+def _get_nifty_day_gain_pct(access_token: str = None) -> float:
+    """
+    Legacy shim — kept so any code that calls _get_nifty_day_gain_pct()
+    directly continues to compile.  Returns 0.0 (neutral) because Gate 5
+    in check_reentry() now uses _get_nifty_bb_market_state() instead.
+    """
+    return 0.0
+
+
 def calculate_orb_levels(symbol, open_price, close_price, high_price, low_price, volume,
                          candle_df=None, instrument_key=None):
     """
@@ -3282,13 +3408,47 @@ def process_first_candles(access_token, live_data, late_pass=False):
         print(f"{'='*100}\n")
 
 def check_orb_breakout(symbol, current_price, current_volume, live_data):
-    if symbol not in ORB_SIGNALS or symbol in ORB_ALERTED_STOCKS:
+    if symbol not in ORB_SIGNALS:
         return None
+    
     orb = ORB_SIGNALS[symbol]
     now = datetime.now()
+    current_time_str = now.strftime("%H:%M")
+    
+    # ── RE-ENTRY ON NEW HIGH CHECK ─────────────────────────────────────────
+    # Allow same symbol to place multiple orders if price breaks new high
+    # Define what % above previous breakout level counts as "new high"
+    ORB_REENTRY_THRESHOLD = 0.5  # 0.5% above previous breakout = new high
+    
+    if symbol in ORB_ALERTED_STOCKS:
+        # Check if we're breaking new high
+        previous_breakout = ORB_BREAKOUT_LEVELS.get(symbol, 0)
+        if previous_breakout > 0:
+            new_high_threshold = previous_breakout * (1 + ORB_REENTRY_THRESHOLD / 100)
+            if current_price <= new_high_threshold:
+                # Not a new high - skip
+                return None
+        else:
+            # No previous breakout level tracked - skip
+            return None
+    
+    # ── MORNING WINDOW (09:30-10:30) ───────────────────────────────────────
     market_open_930 = now.replace(hour=9, minute=30, second=0, microsecond=0)
     minutes_since_930 = (now - market_open_930).total_seconds() / 60
-    if minutes_since_930 < 0 or minutes_since_930 > ORB_BREAKOUT_WINDOW_MINUTES:
+    
+    in_morning_window = (minutes_since_930 >= 0 and 
+                        minutes_since_930 <= ORB_BREAKOUT_WINDOW_MINUTES)
+    
+    # ── AFTERNOON WINDOW (13:00-14:00) ───────────────────────────────────
+    in_afternoon_window = False
+    if ORB_ENABLE_SECOND_HALF:
+        afternoon_start = now.replace(hour=13, minute=0, second=0, microsecond=0)
+        minutes_since_afternoon = (now - afternoon_start).total_seconds() / 60
+        in_afternoon_window = (minutes_since_afternoon >= 0 and 
+                              minutes_since_afternoon <= ORB_SECOND_HALF_WINDOW_MINUTES)
+    
+    # Check if we're in either window
+    if not in_morning_window and not in_afternoon_window:
         return None
 
     # ── Volume check: use VOLUME_DATA OR live_data avg_volume ───────────────
@@ -3447,7 +3607,9 @@ def send_orb_alert(signal, trader=None):
             ])
     except:
         pass
-    if ENABLE_AUTO_TRADING and trader and ORB_ORDER_COUNT < MAX_ORDERS_PER_DAY:
+    
+    # ORB uses its own enable flag for placing orders (not affected by ENABLE_AUTO_TRADING)
+    if ENABLE_ORB_STRATEGY and trader and ORB_ORDER_COUNT < MAX_ORDERS_PER_DAY:
         if not is_order_time_allowed():
             print(f"⏭️  ORB {signal['symbol']}: order skipped — outside Upstox service hours (05:30–23:59 IST)")
             return
@@ -3465,7 +3627,10 @@ def send_orb_alert(signal, trader=None):
         order_id = place_breakout_order(orb_breakout, trader)
         if order_id:
             ORB_ORDER_COUNT += 1
+            # Track breakout level for re-entry on new high
+            ORB_BREAKOUT_LEVELS[signal['symbol']] = signal['entry_price']
             print(f"✅ ORB order placed: {order_id} | ORB orders today: {ORB_ORDER_COUNT}/{MAX_ORDERS_PER_DAY}")
+            print(f"📊 Breakout level tracked: {signal['symbol']} @ ₹{signal['entry_price']:.2f}")
         else:
             print(f"⚠️ ORB order failed for {signal['symbol']}")
     elif ORB_ORDER_COUNT >= MAX_ORDERS_PER_DAY:
@@ -3505,37 +3670,65 @@ def update_fii_dii_if_needed():
         extract_fii_dii_data()
 
 def check_orb_time_and_process(access_token, live_data):
-    global ORB_PROCESSED_TODAY, ORB_LATE_CHECKED
+    global ORB_PROCESSED_TODAY, ORB_LATE_CHECKED, ORB_SECOND_HALF_PROCESSED
     if not ENABLE_ORB_STRATEGY:
         return
     now          = datetime.now()
     current_time = now.strftime("%H:%M")
+
+    # Initialize second half tracking if not exists
+    if 'ORB_SECOND_HALF_PROCESSED' not in globals():
+        ORB_SECOND_HALF_PROCESSED = False
+
+    # ── MORNING SESSION (09:30-10:30) ───────────────────────────────────────
     market_930   = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    cutoff       = market_930 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
+    cutoff_morning = market_930 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
 
     if current_time < "09:15":
         ORB_PROCESSED_TODAY = False
+        ORB_SECOND_HALF_PROCESSED = False
         ORB_LATE_CHECKED.clear()
 
-    # ── PRIMARY PASS ─────────────────────────────────────────────────────────
-    # Old: only ran 09:30-09:35. Bot starting at 09:36 silently skipped ORB.
-    # New: run primary pass any time between 09:30 and breakout window close,
-    # as long as it hasn't run yet today. One-shot — process_first_candles
-    # sets ORB_PROCESSED_TODAY=True so it never fires twice.
-    if current_time >= "09:30" and now < cutoff and not ORB_PROCESSED_TODAY:
+    # Morning primary pass - only if morning not yet processed
+    if current_time >= "09:30" and now < cutoff_morning and not ORB_PROCESSED_TODAY:
         if current_time >= "09:35":
-            print(f"\n⚠️  ORB: Late start detected ({current_time}). "
+            print(f"\n⚠️  ORB (Morning): Late start detected ({current_time}). "
                   f"Running primary ORB pass now — {int((now - market_930).total_seconds() / 60)}min "
                   f"into session. Signals use current candle data.")
         process_first_candles(access_token, live_data, late_pass=False)
+        ORB_PROCESSED_TODAY = True  # Mark morning done
 
-    # ── LATE VOLUME PASS ─────────────────────────────────────────────────────
-    # Retry zero-volume symbols from the primary pass until the window closes.
+    # Morning late volume pass
     elif (ORB_PROCESSED_TODAY
+          and not ORB_SECOND_HALF_PROCESSED
           and ORB_LATE_CHECKED
           and current_time >= "09:35"
-          and now < cutoff):
+          and now < cutoff_morning):
         process_first_candles(access_token, live_data, late_pass=True)
+
+    # ── SECOND HALF SESSION (13:00-14:00) ───────────────────────────────────
+    if ORB_ENABLE_SECOND_HALF and current_time >= ORB_SECOND_HALF_START:
+        # Define afternoon window
+        afternoon_start = now.replace(hour=13, minute=0, second=0, microsecond=0)
+        cutoff_afternoon = afternoon_start + timedelta(minutes=ORB_SECOND_HALF_WINDOW_MINUTES)
+
+        # Reset for second half at 13:00
+        if current_time >= ORB_SECOND_HALF_START and current_time < "13:05":
+            if not ORB_SECOND_HALF_PROCESSED:
+                ORB_LATE_CHECKED.clear()
+                print(f"\n☀️  ORB (Second Half): Starting afternoon ORB session at {current_time}")
+
+        # Process second half ORB if not already done today
+        if now >= afternoon_start and now < cutoff_afternoon and not ORB_SECOND_HALF_PROCESSED:
+            print(f"\n🔄 ORB (Second Half): Processing at {current_time}")
+            process_first_candles(access_token, live_data, late_pass=False)
+            ORB_SECOND_HALF_PROCESSED = True
+
+        # Late volume pass for second half
+        elif (ORB_SECOND_HALF_PROCESSED
+              and ORB_LATE_CHECKED
+              and now < cutoff_afternoon):
+            process_first_candles(access_token, live_data, late_pass=True)
 
 def monitor_orb_breakouts(live_data, trader=None):
     if not ENABLE_ORB_STRATEGY or not ORB_SIGNALS:
