@@ -1,56 +1,72 @@
 name: Upstox Trading Bot
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # TRIGGERS
-#   • Schedule  : runs automatically at 09:10 IST (03:40 UTC) on weekdays
-#   • Manual    : go to Actions tab → "Upstox Trading Bot" → "Run workflow"
-#                 to start at any time
-# ─────────────────────────────────────────────────────────────────────────────
+# • Schedule : runs automatically at 09:10 IST (03:40 UTC) on weekdays
+# • Manual   : Actions tab → "Upstox Trading Bot" → "Run workflow"
+# ───────────────────────────────────────────────────────────────────────────────
 on:
   schedule:
-    # 03:40 UTC = 09:10 IST  (5 min before market open)
-    - cron: '40 0 * * 1-5'   # Mon–Fri only
+    # 03:40 UTC = 09:10 IST (5 min before market open)
+    - cron: '40 3 * * 1-5'       # ← FIXED: was '40 0 *' (00:40 UTC = 06:10 IST, too early)
 
-  workflow_dispatch:          # ← enables the manual "Run workflow" button
+  workflow_dispatch:              # ← enables the manual "Run workflow" button
     inputs:
       reason:
         description: 'Reason for manual run (optional)'
         required: false
         default: 'Manual trigger'
 
+env:
+  # ── FIX #3: Opt into Node.js 24 now, before the June 2 forced cutover ───────
+  # Prevents actions/checkout, actions/cache, etc. from breaking when GitHub
+  # removes Node.js 20 from runners on September 16, 2026.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   run-bot:
     name: Run Trading Bot
     runs-on: ubuntu-latest
-    timeout-minutes: 390      # 6.5 hours — covers full market session + buffer
+    timeout-minutes: 390          # 6.5 hours — covers full market session + buffer
 
     steps:
-      # ── 1. Checkout code ────────────────────────────────────────────────────
+      # ── 1. Checkout code ──────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Set up Python ────────────────────────────────────────────────────
+      # ── 2. Set up Python ──────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # ── 3. Install Chrome + ChromeDriver (for Selenium headless login) ──────
+      # ── 3. Install system dependencies ────────────────────────────────────
+      # FIX #2: xclip is required by pyperclip (used in the bot).
+      # Without it, pyperclip raises an exception at import time on headless
+      # Linux and crashes the bot within seconds (exit code 1, 40s runtime).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y xclip xdotool
+
+      # ── 4. Install Chrome + ChromeDriver (for Selenium headless login) ────
       - name: Install Google Chrome
         run: |
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" \
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
+            | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
+            http://dl.google.com/linux/chrome/deb/ stable main" \
             | sudo tee /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update -q
           sudo apt-get install -y google-chrome-stable
           google-chrome --version
 
-      # ── 4. Install Python dependencies ──────────────────────────────────────
+      # ── 5. Install Python dependencies ───────────────────────────────────
       - name: Install Python packages
         run: pip install -r requirements.txt
 
-      # ── 5. Restore cached candle data (speeds up re-runs) ───────────────────
+      # ── 6. Restore cached candle data (speeds up re-runs) ────────────────
       - name: Restore candle cache
         uses: actions/cache@v4
         with:
@@ -59,7 +75,14 @@ jobs:
           restore-keys: |
             candle-cache-${{ runner.os }}-
 
-      # ── 6. Restore saved token (avoids full OAuth login on every run) ────────
+      # ── 7. Restore saved Upstox token ────────────────────────────────────
+      # NOTE: GitHub Actions cache entries expire after 7 days of no access.
+      # If the bot fails with a ~40s runtime, the cached token has most likely
+      # expired. Refresh it by:
+      #   1. Logging into Upstox → completing OAuth in your browser
+      #   2. Copying the access_token from the redirect URL / response
+      #   3. Updating the UPSTOX_TOKEN secret in:
+      #      Repo → Settings → Secrets and variables → Actions → UPSTOX_TOKEN
       - name: Restore Upstox token
         uses: actions/cache@v4
         with:
@@ -71,30 +94,76 @@ jobs:
           restore-keys: |
             upstox-token-${{ runner.os }}
 
-      # ── 7. Run the bot ───────────────────────────────────────────────────────
+      # ── 8. Validate token before running the bot ──────────────────────────
+      # FIX #1: Quick pre-flight check so the failure is obvious if the token
+      # secret is empty or looks stale, rather than a cryptic exit-code-1
+      # after 40 seconds with no log files.
+      - name: Validate Upstox token secret
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+        run: |
+          if [ -z "$UPSTOX_TOKEN" ]; then
+            echo "⚠️  WARNING: UPSTOX_TOKEN secret is empty."
+            echo "   The bot will attempt Selenium OAuth login instead."
+            echo "   If that also fails, update the secret:"
+            echo "   Repo → Settings → Secrets → UPSTOX_TOKEN"
+          else
+            TOKEN_LEN=${#UPSTOX_TOKEN}
+            echo "✅ UPSTOX_TOKEN is set (length: $TOKEN_LEN chars)"
+          fi
+
+      # ── 9. Run the bot ────────────────────────────────────────────────────
       - name: Run trading bot
         env:
-          # ── Upstox credentials (set these in: Settings → Secrets → Actions) ──
-          UPSTOX_EMAIL:        ${{ secrets.UPSTOX_EMAIL }}
-          UPSTOX_PASSWORD:     ${{ secrets.UPSTOX_PASSWORD }}
-          UPSTOX_MOBILE:       ${{ secrets.UPSTOX_MOBILE }}
-          UPSTOX_PASSCODE:     ${{ secrets.UPSTOX_PASSCODE }}
-          UPSTOX_API_KEY:      ${{ secrets.UPSTOX_API_KEY }}
-          UPSTOX_API_SECRET:   ${{ secrets.UPSTOX_API_SECRET }}
-          UPSTOX_TOKEN:        ${{ secrets.UPSTOX_TOKEN }}
+          # ── Upstox credentials (set in: Settings → Secrets → Actions) ────
+          UPSTOX_EMAIL:      ${{ secrets.UPSTOX_EMAIL }}
+          UPSTOX_PASSWORD:   ${{ secrets.UPSTOX_PASSWORD }}
+          UPSTOX_MOBILE:     ${{ secrets.UPSTOX_MOBILE }}
+          UPSTOX_PASSCODE:   ${{ secrets.UPSTOX_PASSCODE }}
+          UPSTOX_API_KEY:    ${{ secrets.UPSTOX_API_KEY }}
+          UPSTOX_API_SECRET: ${{ secrets.UPSTOX_API_SECRET }}
+          UPSTOX_TOKEN:      ${{ secrets.UPSTOX_TOKEN }}
 
-          # ── AI assistant (optional) ──────────────────────────────────────────
-          GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
+          # ── AI assistant (optional) ───────────────────────────────────────
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
 
-          # ── Display required for Chrome headless ─────────────────────────────
+          # ── Display required for Chrome headless ──────────────────────────
           DISPLAY: ':99'
         run: |
           # Start virtual display for Chrome
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
-          python Both4withcache10_headless.py
 
-      # ── 8. Save updated token for next run ───────────────────────────────────
+          # FIX #4: Wrap in a Python crash-logger so any unhandled exception
+          # is written to crash_log.txt before the process exits.
+          # This file is uploaded as an artifact below, giving you the full
+          # traceback even when the bot crashes at startup.
+          python - <<'PYEOF'
+          import traceback, sys, os
+
+          # Write crash log on any unhandled exception
+          def run():
+              import importlib.util, types
+              spec = importlib.util.spec_from_file_location(
+                  "bot", "Both4withcache10_headless.py"
+              )
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+
+          try:
+              run()
+          except SystemExit as e:
+              # Honour explicit sys.exit() calls (e.g. market-closed clean exit)
+              sys.exit(e.code)
+          except Exception:
+              tb = traceback.format_exc()
+              print("❌ UNHANDLED EXCEPTION:\n" + tb, file=sys.stderr)
+              with open("crash_log.txt", "w") as f:
+                  f.write(tb)
+              sys.exit(1)
+          PYEOF
+
+      # ── 10. Save updated token for next run ───────────────────────────────
       - name: Save Upstox token (post-run)
         if: always()
         uses: actions/cache@v4
@@ -105,14 +174,18 @@ jobs:
             token_timestamp.json
           key: upstox-token-${{ runner.os }}
 
-      # ── 9. Upload all log/CSV files as artifacts ─────────────────────────────
+      # ── 11. Upload all log / CSV files as artifacts ───────────────────────
+      # FIX #4 (cont.): crash_log.txt added to paths so startup crashes are
+      # always downloadable, even when no trading log files were created.
       - name: Upload trading logs
-        if: always()          # upload even if bot crashed
+        if: always()           # upload even if the bot crashed
         uses: actions/upload-artifact@v4
         with:
           name: trading-logs-${{ github.run_id }}
           retention-days: 30
+          if-no-files-found: warn   # warn instead of error when bot crashed early
           path: |
+            crash_log.txt
             r3_live_alerts.txt
             r3_live_alerts.csv
             gap_trading_alerts.txt
