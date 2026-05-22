@@ -40,23 +40,19 @@ from bs4 import BeautifulSoup
 sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # Line-buffered
 sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 
-# ============ CREDENTIALS ============
-# Reads from environment variables (GitHub Secrets) first.
-# Falls back to the hardcoded string if the env var is not set.
-# → For local use: edit the fallback strings below.
-# → For GitHub Actions: set secrets at Settings → Secrets and variables → Actions.
-EMAIL           = os.environ.get("UPSTOX_EMAIL",    "your_email@gmail.com")
-EMAIL_PASSWORD  = os.environ.get("UPSTOX_PASSWORD", "your_gmail_app_password")
-MOBILE_NUMBER   = os.environ.get("UPSTOX_MOBILE",   "9999999999")
-PASSCODE        = os.environ.get("UPSTOX_PASSCODE",  "000000")
+# ============ CREDENTIALS - ENV VARS (with hardcoded fallbacks) ============
+EMAIL          = os.environ.get("UPSTOX_EMAIL",    "frzkhn155@gmail.com")
+EMAIL_PASSWORD = os.environ.get("UPSTOX_PASSWORD", "vdeahogzvpsmfirv")
+MOBILE_NUMBER  = os.environ.get("UPSTOX_MOBILE",   "7397408750")
+PASSCODE       = os.environ.get("UPSTOX_PASSCODE", "952495")
 
-# ── Upstox OAuth app credentials ─────────────────────────────────────────────
+# ── Upstox OAuth app credentials (for Android token refresh) ─────────────────
 # Get these from https://account.upstox.com/developer/apps → your app
 # API Key    = "Client ID" on the Upstox developer portal
 # API Secret = "Client Secret"
 # Redirect   = must match exactly what you set in the app (use the one below)
-UPSTOX_API_KEY      = os.environ.get("UPSTOX_API_KEY",    "your_client_id")
-UPSTOX_API_SECRET   = os.environ.get("UPSTOX_API_SECRET", "your_client_secret")
+UPSTOX_API_KEY      = os.environ.get("UPSTOX_API_KEY",    "ea9b2ade-6720-4a0b-a8a5-6e1710f55844")
+UPSTOX_API_SECRET   = os.environ.get("UPSTOX_API_SECRET", "csxmppf5zd")
 UPSTOX_REDIRECT_URI = "http://127.0.0.1:8080/"        # must match your app settings
 
 # ── Headless OAuth local server port ─────────────────────────────────────────
@@ -79,8 +75,8 @@ CHARTINK_COOKIES = {
 # 3. Copy XSRF-TOKEN and ci_session from Request Headers → Cookies
 
 # ========== HARDCODED TOKEN OPTION ==========
-HARDCODED_TOKEN = os.environ.get("UPSTOX_TOKEN", "")  # set via GitHub Secret: UPSTOX_TOKEN
-USE_HARDCODED_TOKEN = True
+HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIyMkM4REwiLCJqdGkiOiI2OWUxYTUxNmVhOTJhNTBmZTYwZjAwY2IiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzc2Mzk1NTQyLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NzY0NjMyMDB9.enP-ZbfL-q4JCJ78u-l9QVDUj71LOV2Ogi8QmeLXRDg"          # Intentionally blank — token is injected via UPSTOX_TOKEN secret
+USE_HARDCODED_TOKEN = True   # Disabled — bot reads upstox_token.txt written by the workflow
 
 # Token timestamp file
 TOKEN_TIMESTAMP_FILE = "token_timestamp.json"
@@ -118,7 +114,7 @@ FAST_TRADE_ENTRY_FILE = "fast_trades_entries.csv"
 FAST_TRADE_EXIT_FILE = "fast_trades_exits.csv"
 
 # AUTOMATED TRADING CONFIGURATION
-ENABLE_AUTO_TRADING = False          # R3/S3 Breakout - SIGNALS ONLY (orders disabled)
+ENABLE_AUTO_TRADING = True
 ORDER_QUANTITY = 1
 ORDER_PRODUCT = 'D'                   # <-- changed from 'I' to 'D' (NRML for options)
 PLACE_STOPLOSS = True
@@ -128,15 +124,13 @@ MIN_ORDER_GAP_SECONDS = 300
 ORDER_VERIFICATION_DELAY = 3
 
 # TEST MODE (FALSE = normal market hours)
-TEST_MODE = True
+TEST_MODE = False
 BYPASS_MARKET_CHECKS = TEST_MODE      # used in is_market_open / is_market_stabilized
 
 # When TEST_MODE=True and the bot starts before 05:30 IST, wait until the
 # Upstox order window opens rather than running and generating rejected orders.
 # Set False to scan immediately without waiting (signals logged, orders blocked).
-# ✅ UPDATED: False = script runs/scans at ANY time; orders are still blocked
-# by Upstox API outside 05:30–23:59 IST (exchange rule, not our restriction).
-WAIT_FOR_ORDER_WINDOW = False
+WAIT_FOR_ORDER_WINDOW = True
 
 # EXIT STRATEGY CONFIGURATION
 ENABLE_EXIT_MANAGEMENT = True
@@ -153,7 +147,7 @@ ENABLE_STRATEGY_EXITS = True
 POSITION_MONITORING_INTERVAL = 30
 
 # GAP TRADING CONFIGURATION
-ENABLE_GAP_TRADING = False           # SIGNALS ONLY (orders disabled)
+ENABLE_GAP_TRADING = True
 GAP_THRESHOLD_PERCENT = 1.0
 GAP_FILL_THRESHOLD = 0.3
 MAX_GAP_PERCENT = 5.0
@@ -164,7 +158,7 @@ GAP_MIN_VOLUME_RATIO = 1.2
 GAP_FILL_EXIT_PERCENT = 80
 
 # BOX THEORY CONFIGURATION
-ENABLE_BOX_TRADING = False           # SIGNALS ONLY (orders disabled)
+ENABLE_BOX_TRADING = True
 BOX_CONFIRMATION_CYCLES = 2
 BOX_VOLUME_THRESHOLD_MULTIPLIER = 1.0
 BOX_REENTRY_EXIT_PERCENT = 0.5
@@ -176,7 +170,7 @@ MAX_ENTRY_DISTANCE_PERCENT = 1.5  # Skip CE if price > 1.5% above box top at con
                                    # Skip PE if price > 1.5% below box bottom at confirmation
 
 # RANGE TRADING CONFIGURATION
-ENABLE_RANGE_TRADING = False         # SIGNALS ONLY (orders disabled)
+ENABLE_RANGE_TRADING = True
 RANGE_BOUNCE_THRESHOLD = 0.5
 BOUNCE_VOLUME_MULTIPLIER = 1.2
 
@@ -202,7 +196,7 @@ CACHE_UPDATE_HOUR = 18  # Update cache after market close (6 PM)
 CACHE_STATS_FILE = "cache_stats.json"
 
 # ============ FAST TRADING CONFIGURATION ============
-ENABLE_FAST_TRADING = False          # SIGNALS ONLY (orders disabled)
+ENABLE_FAST_TRADING = True
 
 # ── DUAL TIMEFRAME CONFIGURATION ─────────────────────────────────────────────
 # SQUEEZE (LONG) signals use 15min candles — catches real breakouts with
@@ -261,51 +255,6 @@ ENABLE_SECOND_HALF_SHORT_REWATCH  = True    # master switch
 SECOND_HALF_START                  = "12:30" # HH:MM — market mid-point
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── SAME-DIRECTION RE-ENTRY (applies to R3, S3, BOX_TOP, BOX_BOTTOM, BOUNCE, REJECT) ──
-# When a stock has already fired a signal and later makes a confirmed new leg
-# (new session high for LONGs, new session low for SHORTs) with still-elevated
-# volume, the bot allows ONE additional same-direction re-entry per symbol per
-# day.  All five safety gates must pass simultaneously:
-#   1. Cooldown: ≥ REENTRY_COOLDOWN_MINS since first signal
-#   2. New leg:  session high > first-entry-price × (1 + REENTRY_MIN_GAIN_PCT%)
-#   3. Volume:   current ratio ≥ first-entry-volume × REENTRY_VOLUME_MULTIPLIER
-#   4. Market:   Nifty day-gain ≥ REENTRY_NIFTY_MIN_GAIN_PCT (long re-entries)
-#   5. Confirmations: REENTRY_CONFIRM_SCANS consecutive scans holding above level
-#
-# Capped at REENTRY_MAX_PER_SYMBOL re-entries per symbol per day.
-ENABLE_REENTRY              = True    # master switch (covers all non-ORB strategies)
-REENTRY_COOLDOWN_MINS       = 30      # minutes between first entry and re-entry
-REENTRY_MIN_GAIN_PCT        = 0.5     # % above first entry price for new-high gate
-REENTRY_VOLUME_MULTIPLIER   = 1.2     # volume ratio must be ≥ first ratio × this
-REENTRY_NIFTY_MIN_GAIN_PCT  = 0.0   # Legacy constant — kept for backward compat;
-                                     # actual filter now uses 15-min BB (see below).
-                                     # Set 0.0 so old code paths don't block re-entries.
-REENTRY_CONFIRM_SCANS       = 2       # consecutive confirmations required (anti-fake)
-REENTRY_MAX_PER_SYMBOL      = 1       # hard cap: max re-entries per symbol per day
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── NIFTY 15-MIN BOLLINGER BAND RE-ENTRY FILTER ───────────────────────────────
-# Replaces the simple daily-gain-% check with a real-time market context derived
-# from Nifty 50's own 15-min Bollinger Bands (period=20, std=2).
-#
-# Logic:
-#   %B > NIFTY_BB_UPPER_BLOCK_LONG  → Nifty near upper band (overbought / extended)
-#                                      → Block NEW LONG re-entries (risk of reversal)
-#   %B < NIFTY_BB_LOWER_BLOCK_SHORT → Nifty near lower band (oversold / extended down)
-#                                      → Block NEW SHORT re-entries
-#   Price above middle band          → Mild bullish bias → LONG re-entries allowed
-#   Price below middle band          → Mild bearish bias → SHORT re-entries allowed
-#   Data unavailable                 → Fail-open (allow re-entry, don't block on error)
-#
-# Set ENABLE_NIFTY_BB_REENTRY_FILTER = False to revert to the old % gain check.
-ENABLE_NIFTY_BB_REENTRY_FILTER    = True
-NIFTY_INSTRUMENT_KEY               = "NSE_INDEX|Nifty 50"
-NIFTY_BB_PERIOD                    = 20
-NIFTY_BB_STD                       = 2
-NIFTY_BB_UPPER_BLOCK_LONG          = 0.80   # %B ≥ 0.80 → block LONG re-entry
-NIFTY_BB_LOWER_BLOCK_SHORT         = 0.20   # %B ≤ 0.20 → block SHORT re-entry
-# ─────────────────────────────────────────────────────────────────────────────
-
 # ── EARLY TOPPING REVERSAL CONFIG ────────────────────────────────────────────
 # Allows SHORT (and LONG) reversal signals BEFORE 12:30 on fresh symbols.
 # Uses stricter thresholds than the afternoon re-watch to suppress noise.
@@ -329,8 +278,8 @@ FII_DII_CACHE_FILE = "fii_dii_cache.json"
 # ── FII/DII MULTI-DAY TREND ANALYSIS ─────────────────────────────────────────
 # Reads historical FII_DII_YYYYMMDD.csv files to detect institutional patterns:
 #   STRONG_ACCUMULATION : Both FII cash + FNO bought (most bullish)
-#   FII_BUY_DII_SELL    : FII bought cash, FNO sold (FII leading — bullish lean)
-#   FII_SELL_DII_BUY    : FII sold cash, FNO bought (DII support — caution)
+#   FII_BUY_DII_SELL    : FII cash bought, FNO sold (FII leading — bullish lean)
+#   FII_SELL_DII_BUY    : FII cash sold, FNO bought (DII support — caution)
 #   UNUSUAL_CHANGE      : Reversed from previous day (both sold -> both bought etc.)
 ENABLE_FII_DII_TREND_FILTER  = True   # Master switch for trend-based adjustments
 FII_DII_TREND_CACHE_FILE     = "fii_dii_trend_cache.json"
@@ -344,20 +293,15 @@ FII_DII_SCORE_UNUSUAL        = +2     # sudden reversal — high conviction move
 
 # ORB STRATEGY CONFIGURATION
 ENABLE_ORB_STRATEGY = True
-ORB_TIMEFRAME_MINUTES = 15  # First 15 minutes (9:15-9:30)
+ORB_TIMEFRAME_MINUTES = 5  # First 5 minutes (9:15-9:20)
 ORB_MIN_CANDLE_BODY_PERCENT = 0.5  # Minimum 0.5% body size
 ORB_VOLUME_CONFIRMATION = 1.5  # Raised: 1.5x average volume required (was 1.2x)
-ORB_BREAKOUT_WINDOW_MINUTES = 60  # Trade within 60 min of 9:30 (until 10:30)
+ORB_BREAKOUT_WINDOW_MINUTES = 30  # Tightened: only trade within 30 min of 9:20 (was 60)
 ORB_TARGET_MULTIPLIER = 2.0  # Target = 2x candle body
 ORB_STOP_MULTIPLIER = 1.0  # Stop at opposite end of candle
 ORB_MIN_VOLUME = 500000  # Minimum average volume
 ORB_ENABLE_MARKET_ALIGNMENT = True  # Check Nifty direction
 ORB_ENABLE_FII_DII_FILTER = True  # Only trade with FII/DII alignment
-
-# ORB Second Half Configuration (Afternoon session)
-ORB_ENABLE_SECOND_HALF = True       # Enable ORB in afternoon session
-ORB_SECOND_HALF_START = "12:30"     # Start checking for second half ORB (noon)
-ORB_SECOND_HALF_WINDOW_MINUTES = 180 # Trade until 15:30 (extended from 60 to 180 min)
 
 # ORB QUALITY GATE — Klinger + RSI secondary filter
 ORB_ENABLE_KLINGER_GATE   = True   # Require Klinger alignment for ORB signals
@@ -446,6 +390,7 @@ DAILY_PNL = 0.0
 CLOSED_POSITIONS = []
 TRADING_STOPPED = False
 POSITION_PEAK_PRICES = {}
+POSITION_TRAILING_SL  = {}   # Tracks the last SL trigger_price pushed to the broker per position
 
 # FAST TRADING GLOBALS
 FAST_TRADES = {}
@@ -494,10 +439,9 @@ FII_DII_TREND_LOCK                = threading.RLock()  # Thread safety
 # ORB GLOBALS
 ORB_CANDLES = {}
 ORB_SIGNALS = {}
-ORB_LATE_CHECKED = set()   # symbols confirmed zero-volume at 09:30; retry until volume appears
+ORB_LATE_CHECKED = set()   # symbols confirmed zero-volume at 09:20; retry until volume appears
 ORB_ACTIVE_TRADES = {}
 ORB_ALERTED_STOCKS = set()   # fired ORB signal today
-ORB_BREAKOUT_LEVELS = {}     # track highest breakout level per symbol for re-entry
 ORB_ORDER_COUNT = 0
 ORB_PROCESSED_TODAY = False
 
@@ -1544,6 +1488,9 @@ class UpstoxLogin:
                         mail.select("inbox")
                         status, messages = mail.search(None, '(UNSEEN FROM "donotreply@transactions.upstox.com")')
                         if status != "OK" or not messages[0]:
+                            # Fallback: Upstox sometimes sends from a different subdomain
+                            status, messages = mail.search(None, '(UNSEEN FROM "upstox")')
+                        if status != "OK" or not messages[0]:
                             elapsed = int(time.time() - start_time)
                             print(f"⏳ No unread Upstox emails yet... ({elapsed}s)")
                             time.sleep(check_interval)
@@ -2414,6 +2361,41 @@ class UpstoxTrader:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
+    def modify_order(self, order_id, trigger_price, price=0, quantity=None, order_type=None):
+        """Modify an existing SL order on Upstox (used to trail the stop loss).
+        
+        Parameters
+        ----------
+        order_id      : str   – the broker order-id of the live SL order
+        trigger_price : float – new SL trigger price
+        price         : float – new limit price (0 for SL-M / market execution)
+        quantity      : int   – lot quantity (required by Upstox modify endpoint)
+        order_type    : str   – e.g. 'SL_LIMIT' or 'SL' (keep original if None)
+        """
+        endpoint = f"{self.base_url}/order/modify"
+        payload = {
+            "order_id":      order_id,
+            "trigger_price": round(trigger_price, 2),
+            "price":         round(price, 2),
+            "validity":      "DAY",
+        }
+        if quantity is not None:
+            payload["quantity"] = quantity
+        if order_type is not None:
+            payload["order_type"] = order_type.upper()
+        try:
+            print(f"📝 MODIFY SL ORDER: id={order_id}  new_trigger=₹{trigger_price:.2f}")
+            response = self._order_session.put(endpoint, json=payload, timeout=10)
+            result = response.json() if response.text else {"status": "error", "message": "Empty response"}
+            if response.status_code == 200:
+                print(f"✅ SL Modified → trigger ₹{trigger_price:.2f}")
+            else:
+                print(f"⚠️ SL Modify failed ({response.status_code}): {result}")
+            return {"status_code": response.status_code, "response": result}
+        except Exception as e:
+            print(f"❌ SL Modify exception: {e}")
+            return {"status_code": 0, "response": {"status": "error", "message": str(e)}}
+
     def get_ltp(self, instrument_key, max_retries=3):
         endpoint = f"{self.base_url}/market-quote/ltp"
         params = {"instrument_key": instrument_key}
@@ -3105,81 +3087,6 @@ def get_fii_dii_signal(symbol):
             return 'SELL'
     return 'NEUTRAL'
 
-
-# =============================================================================
-# NIFTY 15-MIN BOLLINGER BAND RE-ENTRY FILTER (Change 2)
-# =============================================================================
-def _get_nifty_bb_market_state(access_token: str = None) -> dict:
-    """
-    Fetch Nifty 50 15-min candles and compute Bollinger Band market state.
-
-    Returns a dict:
-      'percent_b'    : float  (%B indicator, 0–1 range; >1 or <0 means outside bands)
-      'above_middle' : bool   price above SMA-20 (mild bullish bias)
-      'bb_state'     : str    one of:
-                           'UPPER_BAND'  → %B ≥ NIFTY_BB_UPPER_BLOCK_LONG   (overbought zone)
-                           'BULLISH'     → above middle, %B < upper block
-                           'NEUTRAL'     → very close to middle (±0.05 %B)
-                           'BEARISH'     → below middle, %B > lower block
-                           'LOWER_BAND'  → %B ≤ NIFTY_BB_LOWER_BLOCK_SHORT  (oversold zone)
-      'ok_for_long'  : bool   safe to enter LONG re-entry
-      'ok_for_short' : bool   safe to enter SHORT re-entry
-      'error'        : bool   True if data unavailable → fail-open
-
-    Uses the module-level _15MIN_CACHE so candles are shared with the fast-trade
-    monitor (no extra network call if already fetched this scan cycle).
-    """
-    _FAIL_OPEN = {
-        'percent_b':    0.5,
-        'above_middle': True,
-        'bb_state':     'NEUTRAL',
-        'ok_for_long':  True,
-        'ok_for_short': True,
-        'error':        True,
-    }
-
-    if not ENABLE_NIFTY_BB_REENTRY_FILTER:
-        return _FAIL_OPEN
-
-    # Check for required globals that might not exist in this older version
-    try:
-        test_access = _INTRADAY_CACHE_LOCK
-    except NameError:
-        # _INTRADAY_CACHE_LOCK doesn't exist in this version - can't use cache
-        if DEBUG_MODE:
-            print(f"⚠️ Nifty BB filter: intraday cache not available — fail-open")
-        return _FAIL_OPEN
-
-    try:
-        test_access = now_ist
-    except NameError:
-        if DEBUG_MODE:
-            print(f"⚠️ Nifty BB filter: now_ist function not available — fail-open")
-        return _FAIL_OPEN
-
-    try:
-        test_access = calculate_bollinger_bands
-    except NameError:
-        if DEBUG_MODE:
-            print(f"⚠️ Nifty BB filter: calculate_bollinger_bands not available — fail-open")
-        return _FAIL_OPEN
-
-    # Placeholder - in the full version this would fetch Nifty 15-min data
-    # For this older version without the required infrastructure, we return fail-open
-    if DEBUG_MODE:
-        print(f"📊 Nifty BB filter: infrastructure check passed but data fetch not implemented in this version")
-    return _FAIL_OPEN
-
-
-def _get_nifty_day_gain_pct(access_token: str = None) -> float:
-    """
-    Legacy shim — kept so any code that calls _get_nifty_day_gain_pct()
-    directly continues to compile.  Returns 0.0 (neutral) because Gate 5
-    in check_reentry() now uses _get_nifty_bb_market_state() instead.
-    """
-    return 0.0
-
-
 def calculate_orb_levels(symbol, open_price, close_price, high_price, low_price, volume,
                          candle_df=None, instrument_key=None):
     """
@@ -3321,12 +3228,12 @@ def calculate_orb_levels(symbol, open_price, close_price, high_price, low_price,
 
 def process_first_candles(access_token, live_data, late_pass=False):
     """
-    Build ORB signals from the first 15-minute candle.
+    Build ORB signals from the first 5-minute candle.
 
     Called in two modes:
-      1. Primary pass (late_pass=False) at 09:30–09:35 — processes all stocks.
+      1. Primary pass (late_pass=False) at 09:20–09:25 — processes all stocks.
          Symbols with zero volume are added to ORB_LATE_CHECKED for retry.
-      2. Late pass (late_pass=True) at 09:35 until the breakout window closes —
+      2. Late pass (late_pass=True) at 09:25 until the breakout window closes —
          only retries symbols in ORB_LATE_CHECKED that still lack a signal and
          now have volume.  Once a symbol gets a signal (or volume stays zero all
          the way to the window close) it is removed from ORB_LATE_CHECKED.
@@ -3334,14 +3241,14 @@ def process_first_candles(access_token, live_data, late_pass=False):
     global ORB_SIGNALS, ORB_PROCESSED_TODAY, ORB_LATE_CHECKED
     if not late_pass:
         print(f"\n{'='*100}")
-        print("📊 PROCESSING FIRST 15-MINUTE CANDLES FOR ORB STRATEGY")
+        print("📊 PROCESSING FIRST 5-MINUTE CANDLES FOR ORB STRATEGY")
         print(f"{'='*100}\n")
         ORB_LATE_CHECKED.clear()          # fresh slate each trading day
     else:
         if not ORB_LATE_CHECKED:
             return                        # nothing left to retry — skip immediately
         print(f"\n🔄 ORB late-volume pass ({datetime.now().strftime('%H:%M')}) — "
-              f"retrying {len(ORB_LATE_CHECKED)} zero-volume symbols from 09:30")
+              f"retrying {len(ORB_LATE_CHECKED)} zero-volume symbols from 09:20")
 
     orb_count = 0
     very_high = 0
@@ -3408,47 +3315,13 @@ def process_first_candles(access_token, live_data, late_pass=False):
         print(f"{'='*100}\n")
 
 def check_orb_breakout(symbol, current_price, current_volume, live_data):
-    if symbol not in ORB_SIGNALS:
+    if symbol not in ORB_SIGNALS or symbol in ORB_ALERTED_STOCKS:
         return None
-    
     orb = ORB_SIGNALS[symbol]
     now = datetime.now()
-    current_time_str = now.strftime("%H:%M")
-    
-    # ── RE-ENTRY ON NEW HIGH CHECK ─────────────────────────────────────────
-    # Allow same symbol to place multiple orders if price breaks new high
-    # Define what % above previous breakout level counts as "new high"
-    ORB_REENTRY_THRESHOLD = 0.5  # 0.5% above previous breakout = new high
-    
-    if symbol in ORB_ALERTED_STOCKS:
-        # Check if we're breaking new high
-        previous_breakout = ORB_BREAKOUT_LEVELS.get(symbol, 0)
-        if previous_breakout > 0:
-            new_high_threshold = previous_breakout * (1 + ORB_REENTRY_THRESHOLD / 100)
-            if current_price <= new_high_threshold:
-                # Not a new high - skip
-                return None
-        else:
-            # No previous breakout level tracked - skip
-            return None
-    
-    # ── MORNING WINDOW (09:30-10:30) ───────────────────────────────────────
-    market_open_930 = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    minutes_since_930 = (now - market_open_930).total_seconds() / 60
-    
-    in_morning_window = (minutes_since_930 >= 0 and 
-                        minutes_since_930 <= ORB_BREAKOUT_WINDOW_MINUTES)
-    
-    # ── AFTERNOON WINDOW (13:00-14:00) ───────────────────────────────────
-    in_afternoon_window = False
-    if ORB_ENABLE_SECOND_HALF:
-        afternoon_start = now.replace(hour=13, minute=0, second=0, microsecond=0)
-        minutes_since_afternoon = (now - afternoon_start).total_seconds() / 60
-        in_afternoon_window = (minutes_since_afternoon >= 0 and 
-                              minutes_since_afternoon <= ORB_SECOND_HALF_WINDOW_MINUTES)
-    
-    # Check if we're in either window
-    if not in_morning_window and not in_afternoon_window:
+    market_open_920 = now.replace(hour=9, minute=20, second=0, microsecond=0)
+    minutes_since_920 = (now - market_open_920).total_seconds() / 60
+    if minutes_since_920 < 0 or minutes_since_920 > ORB_BREAKOUT_WINDOW_MINUTES:
         return None
 
     # ── Volume check: use VOLUME_DATA OR live_data avg_volume ───────────────
@@ -3607,9 +3480,7 @@ def send_orb_alert(signal, trader=None):
             ])
     except:
         pass
-    
-    # ORB uses its own enable flag for placing orders (not affected by ENABLE_AUTO_TRADING)
-    if ENABLE_ORB_STRATEGY and trader and ORB_ORDER_COUNT < MAX_ORDERS_PER_DAY:
+    if ENABLE_AUTO_TRADING and trader and ORB_ORDER_COUNT < MAX_ORDERS_PER_DAY:
         if not is_order_time_allowed():
             print(f"⏭️  ORB {signal['symbol']}: order skipped — outside Upstox service hours (05:30–23:59 IST)")
             return
@@ -3627,10 +3498,7 @@ def send_orb_alert(signal, trader=None):
         order_id = place_breakout_order(orb_breakout, trader)
         if order_id:
             ORB_ORDER_COUNT += 1
-            # Track breakout level for re-entry on new high
-            ORB_BREAKOUT_LEVELS[signal['symbol']] = signal['entry_price']
             print(f"✅ ORB order placed: {order_id} | ORB orders today: {ORB_ORDER_COUNT}/{MAX_ORDERS_PER_DAY}")
-            print(f"📊 Breakout level tracked: {signal['symbol']} @ ₹{signal['entry_price']:.2f}")
         else:
             print(f"⚠️ ORB order failed for {signal['symbol']}")
     elif ORB_ORDER_COUNT >= MAX_ORDERS_PER_DAY:
@@ -3670,65 +3538,37 @@ def update_fii_dii_if_needed():
         extract_fii_dii_data()
 
 def check_orb_time_and_process(access_token, live_data):
-    global ORB_PROCESSED_TODAY, ORB_LATE_CHECKED, ORB_SECOND_HALF_PROCESSED
+    global ORB_PROCESSED_TODAY, ORB_LATE_CHECKED
     if not ENABLE_ORB_STRATEGY:
         return
     now          = datetime.now()
     current_time = now.strftime("%H:%M")
-
-    # Initialize second half tracking if not exists
-    if 'ORB_SECOND_HALF_PROCESSED' not in globals():
-        ORB_SECOND_HALF_PROCESSED = False
-
-    # ── MORNING SESSION (09:30-10:30) ───────────────────────────────────────
-    market_930   = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    cutoff_morning = market_930 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
+    market_920   = now.replace(hour=9, minute=20, second=0, microsecond=0)
+    cutoff       = market_920 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
 
     if current_time < "09:15":
         ORB_PROCESSED_TODAY = False
-        ORB_SECOND_HALF_PROCESSED = False
         ORB_LATE_CHECKED.clear()
 
-    # Morning primary pass - only if morning not yet processed
-    if current_time >= "09:30" and now < cutoff_morning and not ORB_PROCESSED_TODAY:
-        if current_time >= "09:35":
-            print(f"\n⚠️  ORB (Morning): Late start detected ({current_time}). "
-                  f"Running primary ORB pass now — {int((now - market_930).total_seconds() / 60)}min "
+    # ── PRIMARY PASS ─────────────────────────────────────────────────────────
+    # Old: only ran 09:20-09:25. Bot starting at 09:26 silently skipped ORB.
+    # New: run primary pass any time between 09:20 and breakout window close,
+    # as long as it hasn't run yet today. One-shot — process_first_candles
+    # sets ORB_PROCESSED_TODAY=True so it never fires twice.
+    if current_time >= "09:20" and now < cutoff and not ORB_PROCESSED_TODAY:
+        if current_time >= "09:25":
+            print(f"\n⚠️  ORB: Late start detected ({current_time}). "
+                  f"Running primary ORB pass now — {int((now - market_920).total_seconds() / 60)}min "
                   f"into session. Signals use current candle data.")
         process_first_candles(access_token, live_data, late_pass=False)
-        ORB_PROCESSED_TODAY = True  # Mark morning done
 
-    # Morning late volume pass
+    # ── LATE VOLUME PASS ─────────────────────────────────────────────────────
+    # Retry zero-volume symbols from the primary pass until the window closes.
     elif (ORB_PROCESSED_TODAY
-          and not ORB_SECOND_HALF_PROCESSED
           and ORB_LATE_CHECKED
-          and current_time >= "09:35"
-          and now < cutoff_morning):
+          and current_time >= "09:25"
+          and now < cutoff):
         process_first_candles(access_token, live_data, late_pass=True)
-
-    # ── SECOND HALF SESSION (13:00-14:00) ───────────────────────────────────
-    if ORB_ENABLE_SECOND_HALF and current_time >= ORB_SECOND_HALF_START:
-        # Define afternoon window
-        afternoon_start = now.replace(hour=13, minute=0, second=0, microsecond=0)
-        cutoff_afternoon = afternoon_start + timedelta(minutes=ORB_SECOND_HALF_WINDOW_MINUTES)
-
-        # Reset for second half at 13:00
-        if current_time >= ORB_SECOND_HALF_START and current_time < "13:05":
-            if not ORB_SECOND_HALF_PROCESSED:
-                ORB_LATE_CHECKED.clear()
-                print(f"\n☀️  ORB (Second Half): Starting afternoon ORB session at {current_time}")
-
-        # Process second half ORB if not already done today
-        if now >= afternoon_start and now < cutoff_afternoon and not ORB_SECOND_HALF_PROCESSED:
-            print(f"\n🔄 ORB (Second Half): Processing at {current_time}")
-            process_first_candles(access_token, live_data, late_pass=False)
-            ORB_SECOND_HALF_PROCESSED = True
-
-        # Late volume pass for second half
-        elif (ORB_SECOND_HALF_PROCESSED
-              and ORB_LATE_CHECKED
-              and now < cutoff_afternoon):
-            process_first_candles(access_token, live_data, late_pass=True)
 
 def monitor_orb_breakouts(live_data, trader=None):
     if not ENABLE_ORB_STRATEGY or not ORB_SIGNALS:
@@ -5543,7 +5383,7 @@ def get_available_margin(trader):
 
 def place_fast_trade_order(setup, trader, symbol, instrument_key):
     """Place OPTION orders for fast trading setups"""
-    global FAST_TRADE_ORDER_COUNT, LAST_ORDER_TIME, PLACED_ORDERS, ACTIVE_POSITIONS, TRADING_STOPPED
+    global FAST_TRADE_ORDER_COUNT, LAST_ORDER_TIME, PLACED_ORDERS, ACTIVE_POSITIONS, TRADING_STOPPED, POSITION_TRAILING_SL
 
     if TRADING_STOPPED:
         print("⚠️ Trading stopped - no new orders")
@@ -5696,6 +5536,8 @@ def place_fast_trade_order(setup, trader, symbol, instrument_key):
                             print(f"✅ SL Order ID: {sl_order_id}")
                             PLACED_ORDERS[order_id]['sl_order_id'] = sl_order_id
                             ACTIVE_POSITIONS[order_id]['sl_order_id'] = sl_order_id
+                            # Seed the trailing-SL tracker with the initial level
+                            POSITION_TRAILING_SL[order_id] = sl_trigger
                 except Exception as e:
                     print(f"⚠️ SL placement error: {e}")
 
@@ -7809,7 +7651,7 @@ def should_place_gap_trade(gap_info, signal):
 # ========== EXIT MANAGEMENT FUNCTIONS ==========
 def check_exit_conditions(position, current_price, trader):
     """Check if any exit condition is met for a position"""
-    global DAILY_PNL, POSITION_PEAK_PRICES
+    global DAILY_PNL, POSITION_PEAK_PRICES, POSITION_TRAILING_SL
     
     if not ENABLE_EXIT_MANAGEMENT:
         return False, None
@@ -7865,18 +7707,49 @@ def check_exit_conditions(position, current_price, trader):
         return True, "TARGET_PROFIT"
     
     # 6. TRAILING STOP-LOSS (Activate after specified profit %)
+    #    Stage 1 – initial SL order is placed immediately after entry (see entry logic).
+    #    Stage 2 – here we monitor price and MODIFY the live SL order on the broker
+    #              every time price reaches a new peak, ratcheting the stop upward.
     if ENABLE_TRAILING_STOP and pnl_percent >= TRAILING_STOP_ACTIVATION:
-        # Track peak price for this position
+        # --- update in-memory peak ---
         if position_id not in POSITION_PEAK_PRICES:
             POSITION_PEAK_PRICES[position_id] = current_price
         else:
             POSITION_PEAK_PRICES[position_id] = max(POSITION_PEAK_PRICES[position_id], current_price)
-        
-        peak_price = POSITION_PEAK_PRICES[position_id]
-        trailing_stop_price = peak_price * (1 - TRAILING_STOP_PERCENTAGE / 100)
-        
-        if current_price <= trailing_stop_price:
-            return True, f"TRAILING_STOP (Peak: ₹{peak_price:.2f})"
+
+        peak_price            = POSITION_PEAK_PRICES[position_id]
+        new_trailing_sl       = round(peak_price * (1 - TRAILING_STOP_PERCENTAGE / 100), 2)
+        last_broker_sl        = POSITION_TRAILING_SL.get(position_id)
+        sl_order_id           = position.get('sl_order_id')
+
+        # --- push updated trigger to broker only when SL has moved up meaningfully ---
+        MIN_SL_MOVE_PCT = 0.10   # only modify if SL shifted by ≥ 0.10 % (avoids API noise)
+        should_modify = (
+            sl_order_id is not None
+            and (
+                last_broker_sl is None                                        # first time activating
+                or new_trailing_sl > last_broker_sl * (1 + MIN_SL_MOVE_PCT / 100)  # moved up
+            )
+        )
+        if should_modify:
+            modify_result = trader.modify_order(
+                order_id      = sl_order_id,
+                trigger_price = new_trailing_sl,
+                price         = 0,                          # SL-M: execute at market when triggered
+                quantity      = position.get('quantity'),
+                order_type    = 'SL',                       # SL-M
+            )
+            if modify_result.get('status_code') == 200:
+                POSITION_TRAILING_SL[position_id] = new_trailing_sl
+                print(f"   🔒 Trailing SL updated → ₹{new_trailing_sl:.2f}  (peak ₹{peak_price:.2f})")
+            else:
+                # Broker modify failed – fall back to software-side check so we still exit
+                print(f"   ⚠️ Broker SL modify failed; software-side guard still active.")
+
+        # --- software-side safety net (catches the stop even if modify failed) ---
+        effective_sl = POSITION_TRAILING_SL.get(position_id, new_trailing_sl)
+        if current_price <= effective_sl:
+            return True, f"TRAILING_STOP (Peak: ₹{peak_price:.2f}, SL: ₹{effective_sl:.2f})"
     
     # 7. STRATEGY-SPECIFIC EXITS
     if ENABLE_STRATEGY_EXITS and underlying_key:
@@ -7941,7 +7814,7 @@ def check_exit_conditions(position, current_price, trader):
 
 def exit_position(trader, position_id, position, exit_price, reason):
     """Execute position exit and update tracking"""
-    global ACTIVE_POSITIONS, DAILY_PNL, CLOSED_POSITIONS, POSITION_PEAK_PRICES
+    global ACTIVE_POSITIONS, DAILY_PNL, CLOSED_POSITIONS, POSITION_PEAK_PRICES, POSITION_TRAILING_SL
     
     symbol = position.get('option_symbol') or position['symbol']
     quantity = position['quantity']
@@ -8029,6 +7902,8 @@ def exit_position(trader, position_id, position, exit_price, reason):
             # Clean up peak price tracking
             if position_id in POSITION_PEAK_PRICES:
                 del POSITION_PEAK_PRICES[position_id]
+            if position_id in POSITION_TRAILING_SL:
+                del POSITION_TRAILING_SL[position_id]
             
             print(f"{'='*120}\n")
             return True
@@ -8333,6 +8208,64 @@ def check_ha_reversal_alerts(access_token: str, trader=None):
         confirmed_str = "CONFIRMED ✅" if klinger_confirms else "UNCONFIRMED ⚠️ (HA flip only)"
         counter       = "SHORT/PE" if signal == 'LONG' else "LONG/CE"
         arrow         = "🔴" if signal == 'LONG' else "🟢"
+
+        # ── NEW: Check profit and trailing stop before auto‑exit ─────────────────
+        # Get current P&L % from the position (already updated by monitor_active_positions)
+        pnl_pct = position.get('pnl_percent', 0.0)
+        pos_abs_pnl = abs(pnl_pct)
+
+        # Minimum profit threshold: do not auto‑exit if profit is too small
+        HA_AUTO_EXIT_MIN_PROFIT_PCT = 10.0   # configurable, can be adjusted
+        if klinger_confirms and trader is not None and pos_abs_pnl < HA_AUTO_EXIT_MIN_PROFIT_PCT:
+            print(
+                f"\n⚡ HA reversal detected but AUTO-EXIT BLOCKED for {symbol} ({signal})\n"
+                f"   Reason: Profit {pnl_pct:+.1f}% < {HA_AUTO_EXIT_MIN_PROFIT_PCT}% minimum.\n"
+                f"   Flip will be logged but position will stay open."
+            )
+            # Still print the alert (so user sees it) but do NOT exit
+            print(
+                f"\n{'='*80}\n"
+                f"{arrow} HA REVERSAL ALERT — {symbol} | {signal} position\n"
+                f"{'='*80}\n"
+                f"   HA flip:       [{c_prev2}] → [{c_prev1}] → [{c_last}] "
+                f"(2 consecutive {c_last} candles)\n"
+                f"   Klinger:       {ko_desc}\n"
+                f"   Confirmation:  {confirmed_str}\n"
+                f"   Entry price:   ₹{entry_price:.2f} | Underlying LTP: ₹{underlying_ltp:.2f}\n"
+                f"   Current P&L:   {pnl_pct:+.1f}% (below minimum for auto-exit)\n"
+                f"   Suggestion:    Consider exiting {signal} / entering {counter} manually\n"
+                f"{'='*80}"
+            )
+            continue
+
+        # Block auto‑exit if trailing stop is active and drawdown is small
+        # We check: trailing stop active (profit >= TRAILING_STOP_ACTIVATION) AND
+        #            position has a peak price recorded, and drawdown from peak < trailing percentage.
+        HA_BLOCK_WHEN_TRAILING_ACTIVE = True
+        if HA_BLOCK_WHEN_TRAILING_ACTIVE and pnl_pct >= TRAILING_STOP_ACTIVATION and pos_id in POSITION_PEAK_PRICES:
+            peak = POSITION_PEAK_PRICES[pos_id]
+            # Drawdown from peak (percentage)
+            drawdown = (peak - current_price) / peak * 100 if current_price <= peak else 0.0
+            if drawdown < TRAILING_STOP_PERCENTAGE:
+                print(
+                    f"\n⚡ HA reversal detected but AUTO-EXIT BLOCKED for {symbol} ({signal})\n"
+                    f"   Reason: Trailing stop active (profit {pnl_pct:.1f}% >= {TRAILING_STOP_ACTIVATION}%),\n"
+                    f"           drawdown from peak {drawdown:.1f}% < {TRAILING_STOP_PERCENTAGE}% trail.\n"
+                    f"   Letting trailing stop manage exit instead."
+                )
+                # Still print the alert (so user sees it) but do NOT exit
+                print(
+                    f"\n{'='*80}\n"
+                    f"{arrow} HA REVERSAL ALERT — {symbol} | {signal} position\n"
+                    f"{'='*80}\n"
+                    f"   HA flip:       [{c_prev2}] → [{c_prev1}] → [{c_last}]\n"
+                    f"   Klinger:       {ko_desc}\n"
+                    f"   Confirmation:  {confirmed_str}\n"
+                    f"   Trailing stop active — auto-exit blocked (drawdown {drawdown:.1f}% < trail)\n"
+                    f"   Entry: ₹{entry_price:.2f} | Peak: ₹{peak:.2f} | Current: ₹{current_price:.2f}\n"
+                    f"{'='*80}"
+                )
+                continue
 
         # ── Enhancement 1: Auto-exit on confirmed flip ───────────────────────
         if klinger_confirms and trader is not None:
@@ -8642,7 +8575,7 @@ def verify_order_result(trader, result, symbol):
 def place_breakout_order(breakout_data, trader):
     """Place OPTION orders for R3/S3/Box/Range breakouts"""
     global DAILY_ORDER_COUNT, BOX_ORDER_COUNT, RANGE_ORDER_COUNT, LAST_ORDER_TIME
-    global PLACED_ORDERS, ACTIVE_POSITIONS, TRADING_STOPPED
+    global PLACED_ORDERS, ACTIVE_POSITIONS, TRADING_STOPPED, POSITION_TRAILING_SL
 
     if TRADING_STOPPED:
         print("⚡ Trading stopped - no new orders")
@@ -8775,6 +8708,7 @@ def place_breakout_order(breakout_data, trader):
                             print(f"✅ SL Order ID: {sl_order_id}")
                             PLACED_ORDERS[order_id]['sl_order_id'] = sl_order_id
                             ACTIVE_POSITIONS[order_id]['sl_order_id'] = sl_order_id
+                            POSITION_TRAILING_SL[order_id] = sl_trigger   # seed initial level
                 except Exception as e:
                     print(f"⚡ SL placement error: {e}")
 
@@ -8786,7 +8720,7 @@ def place_breakout_order(breakout_data, trader):
 
 def place_gap_order(gap_info, signal, trader):
     """Place OPTION orders for gap trading signals"""
-    global GAP_ORDER_COUNT, LAST_ORDER_TIME, PLACED_ORDERS, ACTIVE_POSITIONS
+    global GAP_ORDER_COUNT, LAST_ORDER_TIME, PLACED_ORDERS, ACTIVE_POSITIONS, POSITION_TRAILING_SL
     global GAP_LEVELS, TRADING_STOPPED
 
     if TRADING_STOPPED:
@@ -8918,6 +8852,7 @@ def place_gap_order(gap_info, signal, trader):
                         if sl_order_id:
                             PLACED_ORDERS[order_id]['sl_order_id'] = sl_order_id
                             ACTIVE_POSITIONS[order_id]['sl_order_id'] = sl_order_id
+                            POSITION_TRAILING_SL[order_id] = sl_trigger   # seed initial level
                             print(f" ✅ SL Order: {sl_order_id}")
 
                     if target_result.get('status_code') == 200:
@@ -9344,12 +9279,12 @@ def enhanced_monitor(access_token, keys, symbols):
             # process anything useful without live prices). We just prime the
             # state so scan #1 doesn't need to re-trigger the primary pass.
             _now = datetime.now()
-            _930 = _now.replace(hour=9, minute=30, second=0, microsecond=0)
-            _cutoff = _930 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
+            _920 = _now.replace(hour=9, minute=20, second=0, microsecond=0)
+            _cutoff = _920 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
             _ct = _now.strftime("%H:%M")
-            if ENABLE_ORB_STRATEGY and _ct >= "09:30" and _now < _cutoff and not ORB_PROCESSED_TODAY:
+            if ENABLE_ORB_STRATEGY and _ct >= "09:20" and _now < _cutoff and not ORB_PROCESSED_TODAY:
                 print(f"\n🕘 ORB startup: bot started at {_ct}, within ORB window "
-                      f"(09:30–{_cutoff.strftime('%H:%M')}). "
+                      f"(09:20–{_cutoff.strftime('%H:%M')}). "
                       f"Will run primary ORB pass on first live-data scan.")
             # ── END ORB STARTUP CATCHUP ──────────────────────────────────────
         
