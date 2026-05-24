@@ -19,8 +19,12 @@ from upstox_client.models.token_request import TokenRequest
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-TOKEN_CACHE_FILE = "upstox_token.txt"
-METADATA_FILE = "upstox_token_metadata.json"
+# Shared cache directory — all three repos read/write here so they share one token
+SHARED_CACHE_DIR = Path.home() / ".upstox_bot_cache"
+SHARED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+TOKEN_CACHE_FILE = SHARED_CACHE_DIR / "upstox_token.txt"
+METADATA_FILE    = SHARED_CACHE_DIR / "upstox_token_metadata.json"
 TOKEN_EXPIRY_HOURS = 24
 CREDENTIALS_ENV_VARS = ("UPSTOX_API_KEY", "UPSTOX_API_SECRET")
 CREDENTIALS_CONFIG_FILE = "upstox_config.json"
