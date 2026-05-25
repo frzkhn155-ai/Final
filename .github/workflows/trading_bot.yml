@@ -146,7 +146,37 @@ jobs:
               sys.exit(1)
           PYEOF
 
-      # ── 10. Save updated token for next run ───────────────────────────────
+      # ── 10. Sync fresh token to BOTH repos ───────────────────────────────
+      # If the bot generated a new OAuth token this run, push it to the
+      # UPSTOX_TOKEN secret in both repos so the other bot picks it up
+      # tomorrow without having to re-run OAuth.
+      # Requires a PAT secret GH_PAT with repo scope (Settings → Secrets → Actions).
+      - name: Sync token to both repos
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "⚠️  GH_PAT not set — skipping cross-repo token sync."
+            echo "   Add a PAT with repo scope as GH_PAT in both repos' secrets."
+            exit 0
+          fi
+          TOKEN_VALUE=""
+          if [ -f upstox_token.txt ]; then
+            TOKEN_VALUE=$(cat upstox_token.txt | tr -d '[:space:]')
+          fi
+          if [ -z "$TOKEN_VALUE" ]; then
+            echo "⚠️  upstox_token.txt is empty — nothing to sync."
+            exit 0
+          fi
+          echo "✅ Syncing token (length: ${#TOKEN_VALUE}) to both repos..."
+          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" \
+            --repo frzkhn155-ai/Final
+          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" \
+            --repo frzkhn155-ai/Final-ORB-Only
+          echo "✅ UPSTOX_TOKEN updated in both repositories."
+
+      # ── 12. Save updated token for next run ───────────────────────────────
       - name: Save Upstox token (post-run)
         if: always()
         uses: actions/cache@v4
@@ -157,7 +187,7 @@ jobs:
             token_timestamp.json
           key: upstox-token-${{ runner.os }}
 
-      # ── 11. Upload all log / CSV files as artifacts ───────────────────────
+      # ── 13. Upload all log / CSV files as artifacts ───────────────────────
       - name: Upload trading logs
         if: always()
         uses: actions/upload-artifact@v4
