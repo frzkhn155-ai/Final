@@ -2686,11 +2686,19 @@ def banner():
     print("="*120 + "\n")
 
 def verify_token(token, verbose=True):
-    """Verify API token and return validation status"""
+    """Verify API token and return validation status.
+
+    Upstox JWTs carry an ``exp`` field set to 22:00 IST, but the server
+    actually honours tokens until ~03:30 IST the next day.  Trusting ``exp``
+    alone produces false 🚨 alarms every evening.  We therefore:
+      1. Decode ``exp`` for an informational note only (never block on it).
+      2. Make a live /v2/user/profile call — that is the ground truth.
+      3. Only flag expiry if the API itself returns 401.
+    """
     if verbose:
         print("🔍 Verifying API token...")
 
-    # --- PRE-CHECK: Decode JWT expiry without making API call ---
+    # --- Informational JWT decode (soft, never fatal) ---
     try:
         import base64, json as _json
         parts = token.split('.')
@@ -2698,24 +2706,20 @@ def verify_token(token, verbose=True):
             payload_b64 = parts[1] + '=' * (4 - len(parts[1]) % 4)
             payload = _json.loads(base64.b64decode(payload_b64).decode('utf-8'))
             exp_ts = payload.get('exp')
-            if exp_ts:
+            if exp_ts and verbose:
                 exp_dt = datetime.fromtimestamp(exp_ts, tz=_IST).replace(tzinfo=None)
                 now = now_ist()
-                if now > exp_dt:
-                    print(f"🚨 TOKEN EXPIRED at {exp_dt.strftime('%Y-%m-%d %H:%M:%S')} — IT IS NOW {now.strftime('%H:%M:%S')} — ORDERS WILL FAIL!")
-                    print(f"   ➡ Set USE_HARDCODED_TOKEN=False to auto-login, or update HARDCODED_TOKEN")
+                mins_left = int((exp_dt - now).total_seconds() / 60)
+                if mins_left < 0:
+                    # JWT exp passed but server may still accept — note only
+                    print(f"⚠️  JWT exp field shows {exp_dt.strftime('%H:%M')} IST (now {now.strftime('%H:%M')}) "
+                          f"— Upstox servers stay live until ~03:30 IST; confirming via API...")
                 else:
-                    mins_left = int((exp_dt - now).total_seconds() / 60)
-                    if verbose:
-                        print(f"⏱ Token expires at {exp_dt.strftime('%H:%M:%S')} ({mins_left} min remaining)")
+                    print(f"⏱  JWT exp: {exp_dt.strftime('%H:%M')} IST ({mins_left} min remaining per JWT field)")
     except Exception:
-        pass  # Don't block on JWT decode failure
-    # --- END PRE-CHECK ---
+        pass  # Never block on decode failure
+    # --- End informational decode ---
 
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
     url = "https://api.upstox.com/v2/user/profile"
     try:
         response = _get_upstox_session(token).get(url, timeout=10)
@@ -2734,7 +2738,8 @@ def verify_token(token, verbose=True):
             }
         elif response.status_code == 401:
             if verbose:
-                print("❌ Token is INVALID or EXPIRED")
+                print("❌ Token REJECTED by Upstox API (401) — needs fresh login")
+                print("   ➡ Update UPSTOX_TOKEN secret or re-run OAuth")
             return {
                 'valid': False,
                 'message': 'Token is invalid or expired',
