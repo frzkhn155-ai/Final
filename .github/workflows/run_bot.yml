@@ -1,5 +1,6 @@
-name: Run Trading Bot
+name: Run Trading Bot (Manual)
 
+# Manual-only trigger with optional strategy selection and debug mode
 on:
   workflow_dispatch:
     inputs:
@@ -21,47 +22,148 @@ on:
         default: false
         type: boolean
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 390
 
     steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      # ── 2. Python ────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install dependencies
+      # ── 3. System dependencies ───────────────────────────────────────────────
+      - name: Install system dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          sudo apt-get update -q
+          sudo apt-get install -y xclip xdotool
 
+      # ── 4. Chrome ────────────────────────────────────────────────────────────
+      - name: Install Google Chrome
+        run: |
+          sudo install -m 0755 -d /etc/apt/keyrings
+          wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg
+          sudo chmod a+r /etc/apt/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] \
+            http://dl.google.com/linux/chrome/deb/ stable main" \
+            | sudo tee /etc/apt/sources.list.d/google-chrome.list > /dev/null
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
+
+      # ── 5. Python packages ───────────────────────────────────────────────────
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      # ── 6. Restore candle cache ──────────────────────────────────────────────
+      - name: Restore candle cache
+        uses: actions/cache@v4
+        with:
+          path: candle_cache/
+          key: candle-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            candle-cache-${{ runner.os }}-
+
+      # ── 7. Restore saved token ───────────────────────────────────────────────
+      - name: Restore Upstox token
+        uses: actions/cache@v4
+        with:
+          path: |
+            upstox_token.txt
+            upstox_refresh_token.txt
+            token_timestamp.json
+          key: upstox-token-${{ runner.os }}
+          restore-keys: |
+            upstox-token-${{ runner.os }}
+
+      # ── 8. Run the bot ───────────────────────────────────────────────────────
       - name: Run Trading Bot
         env:
-          UPSTOX_API_KEY: ${{ secrets.UPSTOX_API_KEY }}
+          UPSTOX_EMAIL:      ${{ secrets.UPSTOX_EMAIL }}
+          UPSTOX_PASSWORD:   ${{ secrets.UPSTOX_PASSWORD }}
+          UPSTOX_MOBILE:     ${{ secrets.UPSTOX_MOBILE }}
+          UPSTOX_PASSCODE:   ${{ secrets.UPSTOX_PASSCODE }}
+          UPSTOX_API_KEY:    ${{ secrets.UPSTOX_API_KEY }}
           UPSTOX_API_SECRET: ${{ secrets.UPSTOX_API_SECRET }}
-          UPSTOX_REDIRECT_URI: ${{ secrets.UPSTOX_REDIRECT_URI }}
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          STRATEGY: ${{ github.event.inputs.strategy }}
-          DEBUG_MODE: ${{ github.event.inputs.debug_mode }}
+          UPSTOX_TOKEN:      ${{ secrets.UPSTOX_TOKEN }}
+          GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
+          STRATEGY:          ${{ github.event.inputs.strategy }}
+          DEBUG_MODE:        ${{ github.event.inputs.debug_mode }}
+          DISPLAY: ':99'
         run: |
-          echo "Starting trading bot..."
-          echo "Strategy: $STRATEGY"
-          echo "Debug Mode: $DEBUG_MODE"
-          python Both4withcache10_headless_patched.py
+          echo "Strategy: $STRATEGY | Debug: $DEBUG_MODE"
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 2
 
-      - name: Upload logs (if any)
+          python - <<'PYEOF'
+          import traceback, sys, runpy
+          try:
+              runpy.run_path("Both4withcache10_headless.py", run_name="__main__")
+          except SystemExit as e:
+              sys.exit(e.code)
+          except Exception:
+              tb = traceback.format_exc()
+              print("❌ UNHANDLED EXCEPTION:\n" + tb, file=sys.stderr)
+              with open("crash_log.txt", "w") as f:
+                  f.write(tb)
+              sys.exit(1)
+          PYEOF
+
+      # ── 9. Sync fresh token to both repos ───────────────────────────────────
+      - name: Sync token to both repos
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "⚠️  GH_PAT not set — skipping cross-repo token sync."
+            exit 0
+          fi
+          TOKEN_VALUE=""
+          if [ -f upstox_token.txt ]; then
+            TOKEN_VALUE=$(cat upstox_token.txt | tr -d '[:space:]')
+          fi
+          if [ -z "$TOKEN_VALUE" ]; then
+            echo "⚠️  upstox_token.txt is empty — nothing to sync."
+            exit 0
+          fi
+          echo "✅ Syncing token (length: ${#TOKEN_VALUE}) to both repos..."
+          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/Final
+          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/Final-ORB-Only
+          echo "✅ UPSTOX_TOKEN updated in both repositories."
+
+      # ── 10. Save updated token ───────────────────────────────────────────────
+      - name: Save Upstox token (post-run)
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: |
+            upstox_token.txt
+            upstox_refresh_token.txt
+            token_timestamp.json
+          key: upstox-token-${{ runner.os }}
+
+      # ── 11. Upload logs ──────────────────────────────────────────────────────
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bot-logs
+          name: manual-run-logs-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: warn
           path: |
+            crash_log.txt
             *.log
             *.txt
-          retention-days: 7
+            *.csv
