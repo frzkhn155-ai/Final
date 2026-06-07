@@ -90,8 +90,8 @@ CHARTINK_COOKIES = {
 # 3. Copy XSRF-TOKEN and ci_session from Request Headers → Cookies
 
 # ========== HARDCODED TOKEN OPTION ==========
-HARDCODED_TOKEN = os.environ.get("UPSTOX_TOKEN", "")  # injected via GitHub Secret: UPSTOX_TOKEN
-USE_HARDCODED_TOKEN = True   # reads env var above; falls back to file / OAuth if blank
+HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIyMkM4REwiLCJqdGkiOiI2OWUxYTUxNmVhOTJhNTBmZTYwZjAwY2IiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzc2Mzk1NTQyLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NzY0NjMyMDB9.enP-ZbfL-q4JCJ78u-l9QVDUj71LOV2Ogi8QmeLXRDg"          # Intentionally blank — token is injected via UPSTOX_TOKEN secret
+USE_HARDCODED_TOKEN = True   # Disabled — bot reads upstox_token.txt written by the workflow
 
 # Token timestamp file
 TOKEN_TIMESTAMP_FILE = "token_timestamp.json"
@@ -327,10 +327,41 @@ ORB_MIN_CANDLE_BODY_LONG  = 0.6    # LONG ORB: slightly higher body % required
 ORB_MIN_CANDLE_BODY_SHORT = 0.6    # SHORT ORB: slightly higher body % required
 ORB_REQUIRE_STRONG_FII_FOR_MEDIUM_RSI = True  # If RSI borderline, require STRONG FII/DII
 
+# ── ORB Reversal (contra-trade) config ──────────────────────────────────────
+# When the initial ORB signal reverses strongly, bot fires an OPPOSITE trade.
+# Uses detect_topping_reversal (price at upper BB + doji/wick) AND
+# check_ha_reversal_alerts (HA colour flip + Klinger) as dual confirmation.
+ORB_ENABLE_REVERSAL_TRADE    = True    # Master toggle for contra-ORB trades
+ORB_REVERSAL_MIN_MOVE_PCT    = 0.4    # Price must have moved ≥0.4% against signal before reversal fires
+ORB_REVERSAL_CANDLES_MIN     = 2      # Wait at least 2 candles after ORB signal before checking reversal
+ORB_REVERSAL_REQUIRE_HA      = True   # Require HA colour flip (via check_ha_reversal_alerts) for reversal
+ORB_REVERSAL_REQUIRE_TOPPING = True   # Require detect_topping_reversal confirmation for bearish→bullish flip
+ORB_REVERSAL_WINDOW_MINUTES  = 45     # Only fire reversal within 45 min of original ORB signal
+
 # File paths for ORB logging
 ORB_SIGNALS_FILE = "orb_signals.csv"
-ORB_TRADES_FILE = "orb_trades.csv"
-ORB_LOG_FILE = "orb_trading_log.txt"
+ORB_TRADES_FILE  = "orb_trades.csv"
+ORB_LOG_FILE     = "orb_trading_log.txt"
+
+# ========== FII TREND REVERSAL SHORT (Bearish) CONFIG ==========
+ENABLE_FII_REVERSAL             = True
+FII_REVERSAL_MAX_SYMBOLS        = 30
+FII_REVERSAL_MIN_VOLUME_RATIO   = 1.3
+FII_REVERSAL_EMA_FAST           = 9
+FII_REVERSAL_EMA_SLOW           = 21
+FII_REVERSAL_EMA_TREND          = 50
+FII_REVERSAL_STRATEGY_NAME      = "FII_REVERSAL_SHORT"
+FII_REVERSAL_ALERTED_STOCKS     = set()   # fired today (short side)
+
+# ========== FII TREND REVERSAL LONG (Bullish) CONFIG ==========
+ENABLE_FII_REVERSAL_LONG            = True
+FII_REVERSAL_LONG_MAX_SYMBOLS       = 30
+FII_REVERSAL_LONG_MIN_VOLUME_RATIO  = 1.3
+FII_REVERSAL_LONG_EMA_FAST          = 9
+FII_REVERSAL_LONG_EMA_SLOW          = 21
+FII_REVERSAL_LONG_EMA_TREND         = 50
+FII_REVERSAL_LONG_STRATEGY_NAME     = "FII_REVERSAL_LONG"
+FII_REVERSAL_LONG_ALERTED_STOCKS    = set()   # fired today (long side)
 
 # ============ OPTION TRADING CONFIGURATION ============
 OPTION_PREMIUM_MIN_THRESHOLD = 1.0  # Minimum premium to consider
@@ -459,6 +490,7 @@ ORB_ACTIVE_TRADES = {}
 ORB_ALERTED_STOCKS = set()   # fired ORB signal today
 ORB_ORDER_COUNT = 0
 ORB_PROCESSED_TODAY = False
+ORB_REVERSAL_ALERTED = set()   # symbols that already fired a reversal trade today (one per symbol)
 
 # ── PERSISTENT HTTP SESSIONS ─────────────────────────────────────────────────
 # Reusing a Session keeps the TCP/TLS connection alive across calls.
@@ -2686,19 +2718,11 @@ def banner():
     print("="*120 + "\n")
 
 def verify_token(token, verbose=True):
-    """Verify API token and return validation status.
-
-    Upstox JWTs carry an ``exp`` field set to 22:00 IST, but the server
-    actually honours tokens until ~03:30 IST the next day.  Trusting ``exp``
-    alone produces false 🚨 alarms every evening.  We therefore:
-      1. Decode ``exp`` for an informational note only (never block on it).
-      2. Make a live /v2/user/profile call — that is the ground truth.
-      3. Only flag expiry if the API itself returns 401.
-    """
+    """Verify API token and return validation status"""
     if verbose:
         print("🔍 Verifying API token...")
 
-    # --- Informational JWT decode (soft, never fatal) ---
+    # --- PRE-CHECK: Decode JWT expiry without making API call ---
     try:
         import base64, json as _json
         parts = token.split('.')
@@ -2706,20 +2730,24 @@ def verify_token(token, verbose=True):
             payload_b64 = parts[1] + '=' * (4 - len(parts[1]) % 4)
             payload = _json.loads(base64.b64decode(payload_b64).decode('utf-8'))
             exp_ts = payload.get('exp')
-            if exp_ts and verbose:
+            if exp_ts:
                 exp_dt = datetime.fromtimestamp(exp_ts, tz=_IST).replace(tzinfo=None)
                 now = now_ist()
-                mins_left = int((exp_dt - now).total_seconds() / 60)
-                if mins_left < 0:
-                    # JWT exp passed but server may still accept — note only
-                    print(f"⚠️  JWT exp field shows {exp_dt.strftime('%H:%M')} IST (now {now.strftime('%H:%M')}) "
-                          f"— Upstox servers stay live until ~03:30 IST; confirming via API...")
+                if now > exp_dt:
+                    print(f"🚨 TOKEN EXPIRED at {exp_dt.strftime('%Y-%m-%d %H:%M:%S')} — IT IS NOW {now.strftime('%H:%M:%S')} — ORDERS WILL FAIL!")
+                    print(f"   ➡ Set USE_HARDCODED_TOKEN=False to auto-login, or update HARDCODED_TOKEN")
                 else:
-                    print(f"⏱  JWT exp: {exp_dt.strftime('%H:%M')} IST ({mins_left} min remaining per JWT field)")
+                    mins_left = int((exp_dt - now).total_seconds() / 60)
+                    if verbose:
+                        print(f"⏱ Token expires at {exp_dt.strftime('%H:%M:%S')} ({mins_left} min remaining)")
     except Exception:
-        pass  # Never block on decode failure
-    # --- End informational decode ---
+        pass  # Don't block on JWT decode failure
+    # --- END PRE-CHECK ---
 
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
     url = "https://api.upstox.com/v2/user/profile"
     try:
         response = _get_upstox_session(token).get(url, timeout=10)
@@ -2738,8 +2766,7 @@ def verify_token(token, verbose=True):
             }
         elif response.status_code == 401:
             if verbose:
-                print("❌ Token REJECTED by Upstox API (401) — needs fresh login")
-                print("   ➡ Update UPSTOX_TOKEN secret or re-run OAuth")
+                print("❌ Token is INVALID or EXPIRED")
             return {
                 'valid': False,
                 'message': 'Token is invalid or expired',
@@ -3243,6 +3270,7 @@ def calculate_orb_levels(symbol, open_price, close_price, high_price, low_price,
         'confidence':      confidence,
         'rsi_at_signal':   rsi_value,
         'klinger_at_signal': ko_snap,
+        'signal_time':     now_ist(),   # used by check_orb_reversal window guard
     }
     return result
 
@@ -3524,7 +3552,268 @@ def send_orb_alert(signal, trader=None):
     elif ORB_ORDER_COUNT >= MAX_ORDERS_PER_DAY:
         print(f"⚠️ ORB order limit reached ({ORB_ORDER_COUNT}/{MAX_ORDERS_PER_DAY}) — signal logged only")
 
-def initialize_orb_csv_files():
+
+def check_orb_reversal(symbol, ltp, volume, live_data, access_token, trader=None):
+    """
+    Detect a strong price reversal AFTER an ORB signal has been generated.
+
+    WHY THIS EXISTS — MANKIND 03-Jun-2026 case study:
+    The bot generated a BEARISH_ORB (SELL) signal at 09:20 with VERY_HIGH confidence
+    and STRONG_SELL FII/DII. However the price reversed hard upward after the initial
+    bearish candle. The original ORB machinery only looks for continuation of the
+    initial signal; it has no mechanism to catch the reversal and take the opposite trade.
+
+    HOW IT WORKS:
+    1. A prior ORB signal must exist for the symbol (either direction).
+    2. Price must have moved ≥ORB_REVERSAL_MIN_MOVE_PCT% AGAINST the original signal.
+    3. The reversal window (ORB_REVERSAL_WINDOW_MINUTES) must not have expired.
+    4. For BEARISH→BULLISH flip: detect_topping_reversal on the *inverted* scenario,
+       i.e. the price is now bouncing off the LOWER band — use detect_fast_long_setup
+       as a proxy, or directly check HA flip via _ha_analyse_symbol.
+    5. For BULLISH→BEARISH flip: detect_topping_reversal at upper band.
+    6. check_ha_reversal_alerts (HA colour flip + Klinger) is used as secondary gate.
+    7. Each symbol fires at most ONE reversal trade per session (ORB_REVERSAL_ALERTED).
+
+    Returns a reversal signal dict (same shape as breakout_signal) or None.
+    """
+    global ORB_REVERSAL_ALERTED
+
+    if not ORB_ENABLE_REVERSAL_TRADE:
+        return None
+
+    if symbol not in ORB_SIGNALS:
+        return None
+
+    if symbol in ORB_REVERSAL_ALERTED:
+        return None   # already fired reversal today
+
+    orb = ORB_SIGNALS[symbol]
+    original_direction = orb.get('direction', '')   # 'BUY' or 'SELL'
+    signal_time = orb.get('signal_time')
+
+    # ── Reversal window check ─────────────────────────────────────────────────
+    if signal_time is not None:
+        elapsed = (now_ist() - signal_time).total_seconds() / 60
+        if elapsed > ORB_REVERSAL_WINDOW_MINUTES:
+            if DEBUG_MODE:
+                print(f"⛔ ORB reversal window expired for {symbol} ({elapsed:.0f}min > {ORB_REVERSAL_WINDOW_MINUTES}min)")
+            return None
+
+    # ── Minimum adverse move check ────────────────────────────────────────────
+    breakout_level = orb.get('breakout_level', ltp)
+    if original_direction == 'SELL':
+        # Original signal: bearish. Reversal = price going UP above breakout level.
+        adverse_move_pct = (ltp - breakout_level) / breakout_level * 100
+        reversal_direction = 'BUY'
+        reversal_signal_type = 'ORB_REVERSAL_LONG'
+    else:
+        # Original signal: bullish. Reversal = price going DOWN below breakout level.
+        adverse_move_pct = (breakout_level - ltp) / breakout_level * 100
+        reversal_direction = 'SELL'
+        reversal_signal_type = 'ORB_REVERSAL_SHORT'
+
+    if adverse_move_pct < ORB_REVERSAL_MIN_MOVE_PCT:
+        if DEBUG_MODE:
+            print(f"⛔ ORB reversal: {symbol} adverse move {adverse_move_pct:.2f}% < min {ORB_REVERSAL_MIN_MOVE_PCT}%")
+        return None
+
+    # ── Fetch 5-min candle data for technical analysis ────────────────────────
+    try:
+        df = get_realtime_5min_df(symbol, min_bars=10)
+        if df is None or len(df) < 5:
+            if DEBUG_MODE:
+                print(f"⛔ ORB reversal: {symbol} insufficient candle data")
+            return None
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⛔ ORB reversal: {symbol} candle fetch error: {e}")
+        return None
+
+    candle_count_since_signal = len(df)
+    if candle_count_since_signal < ORB_REVERSAL_CANDLES_MIN:
+        if DEBUG_MODE:
+            print(f"⛔ ORB reversal: {symbol} too few candles since signal ({candle_count_since_signal} < {ORB_REVERSAL_CANDLES_MIN})")
+        return None
+
+    # ── Klinger data for confirmation functions ───────────────────────────────
+    ikey = orb.get('instrument_key') or SYMBOL_TO_ISIN.get(symbol, '')
+    klinger_info = R3_LEVELS.get(ikey, {}).get('klinger') if ikey else None
+
+    # ── Gate 1: detect_topping_reversal (for BEARISH→BULLISH, check lower band bounce) ──
+    # For a BULLISH→BEARISH reversal, detect_topping_reversal directly fits.
+    # For BEARISH→BULLISH, we run detect_topping_reversal on the *inverted* df
+    # (flip OHLC) to reuse the same upper-band-wick logic on the lower band.
+    topping_confirmed = False
+    if ORB_REVERSAL_REQUIRE_TOPPING:
+        try:
+            if reversal_direction == 'SELL':
+                # Price rallied and is now potentially topping — standard detect_topping_reversal
+                topping_result = detect_topping_reversal(df, klinger_data=klinger_info, strict=False)
+                topping_confirmed = topping_result is not None
+            else:
+                # Price sold off and is now potentially bottoming — invert OHLC to reuse function
+                df_inv = df.copy()
+                df_inv['high']  = -df['low']
+                df_inv['low']   = -df['high']
+                df_inv['open']  = -df['open']
+                df_inv['close'] = -df['close']
+                topping_result = detect_topping_reversal(df_inv, klinger_data=klinger_info, strict=False)
+                topping_confirmed = topping_result is not None
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ ORB reversal: detect_topping_reversal error for {symbol}: {e}")
+            topping_confirmed = False
+
+    # ── Gate 2: HA reversal check via _ha_analyse_symbol ─────────────────────
+    # check_ha_reversal_alerts is designed to work on ACTIVE_POSITIONS.
+    # For ORB (alert-only), we directly call _ha_analyse_symbol which is the
+    # underlying per-symbol analyser, and check for the required colour flip.
+    ha_confirmed = False
+    if ORB_REVERSAL_REQUIRE_HA:
+        try:
+            # 'LONG' means we hold a long and are checking for a bearish flip.
+            # Here we want to detect the OPPOSITE: original signal direction went wrong.
+            # e.g. original SELL went wrong → we now want a BULLISH HA flip (colour GREEN)
+            ha_watch_signal = 'SHORT' if reversal_direction == 'BUY' else 'LONG'
+            ha_result = _ha_analyse_symbol(access_token, symbol, ikey, ha_watch_signal)
+            if ha_result is not None:
+                ha_confirmed = ha_result.get('needs_alert', False)
+                if DEBUG_MODE and ha_confirmed:
+                    c2 = ha_result.get('c_prev2', '?')
+                    c1 = ha_result.get('c_prev1', '?')
+                    cl = ha_result.get('c_last', '?')
+                    print(f"✅ ORB reversal HA flip confirmed for {symbol}: [{c2}]→[{c1}]→[{cl}]")
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ ORB reversal: HA check error for {symbol}: {e}")
+            ha_confirmed = False
+
+    # ── Decision: both gates required (configurable) ──────────────────────────
+    if ORB_REVERSAL_REQUIRE_TOPPING and not topping_confirmed:
+        if DEBUG_MODE:
+            print(f"⛔ ORB reversal: {symbol} topping/bottoming pattern not confirmed")
+        return None
+
+    if ORB_REVERSAL_REQUIRE_HA and not ha_confirmed:
+        if DEBUG_MODE:
+            print(f"⛔ ORB reversal: {symbol} HA colour flip not confirmed")
+        return None
+
+    # ── Volume check ──────────────────────────────────────────────────────────
+    avg_volume = (VOLUME_DATA.get(symbol, {}).get('avg_volume')
+                  or VOLUME_DATA.get(symbol, {}).get('avg_vol_20d')
+                  or live_data.get('avg_volume', 0))
+    volume_ratio = volume / avg_volume if avg_volume > 0 else 0
+
+    if avg_volume > 0 and volume_ratio < ORB_VOLUME_CONFIRMATION:
+        if DEBUG_MODE:
+            print(f"⛔ ORB reversal: {symbol} volume ratio {volume_ratio:.2f} < {ORB_VOLUME_CONFIRMATION}")
+        return None
+
+    # ── Build reversal signal ─────────────────────────────────────────────────
+    last_candle = df.iloc[-1]
+    if reversal_direction == 'BUY':
+        entry_price = ltp
+        stop_loss   = last_candle['low'] * 0.997   # just below the recent low
+        risk        = entry_price - stop_loss
+        if risk <= 0:
+            return None
+        target      = entry_price + 2.0 * risk
+    else:
+        entry_price = ltp
+        stop_loss   = last_candle['high'] * 1.003  # just above the recent high
+        risk        = stop_loss - entry_price
+        if risk <= 0:
+            return None
+        target      = entry_price - 2.0 * risk
+
+    risk_reward = abs(target - entry_price) / risk if risk > 0 else 0
+
+    # Mark as alerted so this reversal only fires once per symbol per session
+    ORB_REVERSAL_ALERTED.add(symbol)
+
+    return {
+        'symbol':           symbol,
+        'signal':           reversal_signal_type,
+        'direction':        reversal_direction,
+        'entry_price':      entry_price,
+        'stop_loss':        stop_loss,
+        'target':           target,
+        'volume_ratio':     volume_ratio,
+        'risk':             risk,
+        'reward':           abs(target - entry_price),
+        'risk_reward':      risk_reward,
+        'confidence':       orb.get('confidence', 'HIGH'),
+        'fii_dii_signal':   orb.get('fii_dii_signal', 'NEUTRAL'),
+        'orb_data':         orb,
+        'adverse_move_pct': adverse_move_pct,
+        'topping_confirmed': topping_confirmed,
+        'ha_confirmed':     ha_confirmed,
+        'entry_type':       'ORB_REVERSAL',
+        'original_direction': original_direction,
+    }
+
+
+def send_orb_reversal_alert(signal, trader=None):
+    """Print + log an ORB contra/reversal trade alert."""
+    global ORB_ORDER_COUNT
+
+    orig_dir = signal.get('original_direction', '?')
+    arrow    = '🟢' if signal['direction'] == 'BUY' else '🔴'
+
+    print("\n" + "=" * 100)
+    print(f"{arrow} ORB REVERSAL SIGNAL: {signal['symbol']} {arrow}")
+    print("=" * 100)
+    print(f"  Original ORB direction : {orig_dir}  →  NOW REVERSING to {signal['direction']}")
+    print(f"  Signal type            : {signal['signal']}")
+    print(f"  Adverse move vs ORB    : {signal['adverse_move_pct']:.2f}%")
+    print(f"  Topping/Bottoming patt : {'✅ YES' if signal['topping_confirmed'] else '⚠️ NO'}")
+    print(f"  HA colour flip         : {'✅ YES' if signal['ha_confirmed'] else '⚠️ NO'}")
+    print(f"  Confidence             : {signal['confidence']}")
+    print(f"  FII/DII signal         : {signal['fii_dii_signal']}")
+    print(f"  Entry Price            : ₹{signal['entry_price']:.2f}")
+    print(f"  Stop Loss              : ₹{signal['stop_loss']:.2f}")
+    print(f"  Target                 : ₹{signal['target']:.2f}")
+    print(f"  Risk : Reward          : {signal['risk_reward']:.2f}:1")
+    print(f"  Volume                 : {signal['volume_ratio']:.2f}x average")
+    print("=" * 100)
+
+    log_orb_trade(signal, 'REVERSAL_ENTRY')
+
+    with open(ORB_LOG_FILE, 'a', encoding='utf-8') as f:
+        f.write(f"\n{'='*100}\n")
+        f.write(f"ORB REVERSAL ALERT: {now_ist().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Symbol: {signal['symbol']} | Original: {orig_dir} → Reversal: {signal['direction']}\n")
+        f.write(f"Adverse move: {signal['adverse_move_pct']:.2f}% | Topping: {signal['topping_confirmed']} | HA: {signal['ha_confirmed']}\n")
+        f.write(f"Entry: ₹{signal['entry_price']:.2f} | Stop: ₹{signal['stop_loss']:.2f} | Target: ₹{signal['target']:.2f}\n")
+        f.write(f"R:R: {signal['risk_reward']:.2f}:1 | Volume: {signal['volume_ratio']:.2f}x\n")
+        f.write(f"{'='*100}\n")
+
+    if ENABLE_AUTO_TRADING and trader and ORB_ORDER_COUNT < MAX_ORDERS_PER_DAY:
+        if not is_order_time_allowed():
+            print(f"⏭️  ORB Reversal {signal['symbol']}: order skipped — outside trading hours")
+            return
+        print(f"\n📤 Placing ORB REVERSAL {signal['direction']} order for {signal['symbol']}...")
+        orb_breakout = {
+            'symbol':         signal['symbol'],
+            'instrument_key': signal.get('orb_data', {}).get('instrument_key', ''),
+            'breakout_type':  'CE' if signal['direction'] == 'BUY' else 'PE',
+            'strategy':       'ORB_REVERSAL',
+            'entry_price':    signal['entry_price'],
+            'stop_loss':      signal['stop_loss'],
+            'target':         signal['target'],
+            'klinger_status': signal.get('orb_data', {}).get('klinger_at_signal'),
+        }
+        order_id = place_breakout_order(orb_breakout, trader)
+        if order_id:
+            ORB_ORDER_COUNT += 1
+            print(f"✅ ORB Reversal order placed: {order_id} | ORB orders today: {ORB_ORDER_COUNT}/{MAX_ORDERS_PER_DAY}")
+        else:
+            print(f"⚠️ ORB Reversal order failed for {signal['symbol']}")
+    elif ORB_ORDER_COUNT >= MAX_ORDERS_PER_DAY:
+        print(f"⚠️ ORB order limit reached ({ORB_ORDER_COUNT}/{MAX_ORDERS_PER_DAY}) — reversal signal logged only")
+
+
     csv_files = [
         (ORB_SIGNALS_FILE, ['Timestamp', 'Symbol', 'Signal_Type', 'Direction', 
                            'Breakout_Level', 'Stop_Level', 'Target_Level', 
@@ -3569,6 +3858,7 @@ def check_orb_time_and_process(access_token, live_data):
     if current_time < "09:15":
         ORB_PROCESSED_TODAY = False
         ORB_LATE_CHECKED.clear()
+        ORB_REVERSAL_ALERTED.clear()   # reset reversal tracker each morning
 
     # ── PRIMARY PASS ─────────────────────────────────────────────────────────
     # Old: only ran 09:20-09:25. Bot starting at 09:26 silently skipped ORB.
@@ -3605,6 +3895,15 @@ def monitor_orb_breakouts(live_data, trader=None):
             breakout = check_orb_breakout(symbol, ltp, volume, data)
             if breakout:
                 send_orb_alert(breakout, trader)
+                continue   # already acting on continuation — skip reversal check
+
+            # ── ORB Reversal check: price moving against original signal ──────
+            if ORB_ENABLE_REVERSAL_TRADE and symbol not in ORB_REVERSAL_ALERTED:
+                # access_token is not passed to monitor_orb_breakouts; retrieve from module-level
+                _access_token = globals().get('ACCESS_TOKEN', '')
+                reversal = check_orb_reversal(symbol, ltp, volume, data, _access_token, trader)
+                if reversal:
+                    send_orb_reversal_alert(reversal, trader)
         except Exception as e:
             if DEBUG_MODE:
                 print(f"ORB monitor error {symbol_key}: {e}")
@@ -9038,6 +9337,10 @@ def print_final_stats():
     print(f" • Gap Trading Alerts: {len(GAP_ALERTED_STOCKS)} (UP={len(GAP_UP_ALERTED_STOCKS)}, DOWN={len(GAP_DOWN_ALERTED_STOCKS)})")
     print(f" • Fast Trade Alerts: {len(FAST_TRADE_ALERTED_STOCKS)} "
           f"(LONG={len(FAST_TRADE_LONG_ALERTED)}, SHORT={len(FAST_TRADE_SHORT_ALERTED)})")
+    if ENABLE_FII_REVERSAL:
+        print(f" • FII Reversal Short Alerts: {len(FII_REVERSAL_ALERTED_STOCKS)}")
+    if ENABLE_FII_REVERSAL_LONG:
+        print(f" • FII Reversal Long  Alerts: {len(FII_REVERSAL_LONG_ALERTED_STOCKS)}")
     if ENABLE_ORB_STRATEGY:
         print(f" • ORB Alerts: {len(ORB_ALERTED_STOCKS)}")
     
@@ -9047,6 +9350,10 @@ def print_final_stats():
     print(f" • Range Trading Orders: {RANGE_ORDER_COUNT}")
     print(f" • Gap Orders: {GAP_ORDER_COUNT}")
     print(f" • Fast Trade Orders: {FAST_TRADE_ORDER_COUNT}")
+    if ENABLE_FII_REVERSAL:
+        print(f" • FII Reversal Shorts: {len([o for o in PLACED_ORDERS.values() if o.get('strategy') == FII_REVERSAL_STRATEGY_NAME])}")
+    if ENABLE_FII_REVERSAL_LONG:
+        print(f" • FII Reversal Longs : {len([o for o in PLACED_ORDERS.values() if o.get('strategy') == FII_REVERSAL_LONG_STRATEGY_NAME])}")
     if ENABLE_ORB_STRATEGY:
         print(f" • ORB Orders: {ORB_ORDER_COUNT}")
     total_orders = DAILY_ORDER_COUNT + BOX_ORDER_COUNT + RANGE_ORDER_COUNT + GAP_ORDER_COUNT + FAST_TRADE_ORDER_COUNT + ORB_ORDER_COUNT
@@ -9174,6 +9481,12 @@ def print_final_stats():
         f.write(f"Range Trading Alerts: {len(RANGE_ALERTED_STOCKS)} | Orders: {RANGE_ORDER_COUNT}\n")
         f.write(f"Gap Alerts: {len(GAP_ALERTED_STOCKS)} | Orders: {GAP_ORDER_COUNT}\n")
         f.write(f"Fast Trade Alerts: {len(FAST_TRADE_ALERTED_STOCKS)} | Orders: {FAST_TRADE_ORDER_COUNT}\n")
+        if ENABLE_FII_REVERSAL:
+            fii_short_orders = len([o for o in PLACED_ORDERS.values() if o.get('strategy') == FII_REVERSAL_STRATEGY_NAME])
+            f.write(f"FII Reversal Short Alerts: {len(FII_REVERSAL_ALERTED_STOCKS)} | Orders: {fii_short_orders}\n")
+        if ENABLE_FII_REVERSAL_LONG:
+            fii_long_orders = len([o for o in PLACED_ORDERS.values() if o.get('strategy') == FII_REVERSAL_LONG_STRATEGY_NAME])
+            f.write(f"FII Reversal Long  Alerts: {len(FII_REVERSAL_LONG_ALERTED_STOCKS)} | Orders: {fii_long_orders}\n")
         if ENABLE_ORB_STRATEGY:
             f.write(f"ORB Alerts: {len(ORB_ALERTED_STOCKS)} | Orders: {ORB_ORDER_COUNT}\n")
         f.write(f"Total Orders: {DAILY_ORDER_COUNT + BOX_ORDER_COUNT + RANGE_ORDER_COUNT + GAP_ORDER_COUNT + FAST_TRADE_ORDER_COUNT + ORB_ORDER_COUNT}\n")
@@ -9189,6 +9502,261 @@ def print_final_stats():
         f.write(f"{'='*100}\n\n")
 
 # ========== MAIN MONITORING LOOP ==========
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FII TREND REVERSAL — shared helper functions
+# Resamples 5-min candles to 1-hour, computes Heikin-Ashi, and attaches EMAs.
+# Both detect_fii_reversal() and detect_fii_reversal_long() rely on these.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resample_to_1h(df5: 'pd.DataFrame') -> 'pd.DataFrame | None':
+    """
+    Resample a 5-minute OHLCV DataFrame to 1-hour bars.
+    Expects 'timestamp' column (or a DatetimeIndex) plus open/high/low/close/volume.
+    Returns a new DataFrame indexed by hour-start timestamp, or None on failure.
+    """
+    try:
+        import pandas as pd
+        df = df5.copy()
+
+        # Ensure a proper DatetimeIndex
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.set_index('timestamp')
+        elif not isinstance(df.index, pd.DatetimeIndex):
+            return None
+
+        ohlcv = df[['open', 'high', 'low', 'close', 'volume']].copy()
+        df1h = ohlcv.resample('1h').agg({
+            'open':   'first',
+            'high':   'max',
+            'low':    'min',
+            'close':  'last',
+            'volume': 'sum',
+        }).dropna()
+        return df1h.reset_index()
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⛔ resample_to_1h error: {e}")
+        return None
+
+
+def compute_ha_1h(df1h: 'pd.DataFrame') -> 'pd.DataFrame':
+    """
+    Add Heikin-Ashi columns (ha_open, ha_high, ha_low, ha_close, ha_color) to a
+    1-hour OHLC DataFrame in-place and return it.
+    """
+    try:
+        import numpy as np
+        df = df1h.copy()
+        ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4.0
+
+        ha_open = ha_close.copy()
+        ha_open.iloc[0] = (df['open'].iloc[0] + df['close'].iloc[0]) / 2.0
+        for i in range(1, len(df)):
+            ha_open.iloc[i] = (ha_open.iloc[i - 1] + ha_close.iloc[i - 1]) / 2.0
+
+        ha_high = pd.concat([df['high'], ha_open, ha_close], axis=1).max(axis=1)
+        ha_low  = pd.concat([df['low'],  ha_open, ha_close], axis=1).min(axis=1)
+
+        df['ha_open']  = ha_open
+        df['ha_high']  = ha_high
+        df['ha_low']   = ha_low
+        df['ha_close'] = ha_close
+        df['ha_color'] = np.where(ha_close >= ha_open, 'green', 'red')
+        return df
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⛔ compute_ha_1h error: {e}")
+        return df1h
+
+
+def add_ema_indicators_1h(df1h: 'pd.DataFrame') -> 'pd.DataFrame':
+    """
+    Attach three EMA columns (ema_fast, ema_slow, ema_trend) to the 1-hour
+    DataFrame using the FII_REVERSAL config periods (9 / 21 / 50).
+    Works for both short and long configs — periods are identical.
+    """
+    try:
+        df = df1h.copy()
+        src = df['ha_close'] if 'ha_close' in df.columns else df['close']
+        df['ema_fast']  = src.ewm(span=FII_REVERSAL_EMA_FAST,  adjust=False).mean()
+        df['ema_slow']  = src.ewm(span=FII_REVERSAL_EMA_SLOW,  adjust=False).mean()
+        df['ema_trend'] = src.ewm(span=FII_REVERSAL_EMA_TREND, adjust=False).mean()
+        return df
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⛔ add_ema_indicators_1h error: {e}")
+        return df1h
+
+
+def detect_fii_reversal(access_token, live_data):
+    """
+    FII Trend Reversal SHORT Setup (Bearish).
+
+    Scans stocks where FII is BUYING (STRONG_BUY / FII_BUY_DII_SELL) but price
+    shows a 1-hour bearish reversal pattern — a 'distribution' setup where
+    institutional buying is exhausting:
+
+    Entry conditions (all must be true on the *completed* H1 bar, i.e. iloc[-2]):
+      1. Break Low  : current H1 bar's low < previous H1 bar's low
+      2. Red HA     : ha_color == 'red'
+      3. EMA Bear X : ema_fast crosses below ema_slow (prev: fast >= slow, now: fast < slow)
+      4. Below trend: ha_close < ema_trend
+      5. Volume     : live volume ≥ FII_REVERSAL_MIN_VOLUME_RATIO × avg_volume_20d
+
+    Each symbol alerts at most once per session (FII_REVERSAL_ALERTED_STOCKS).
+    """
+    global FII_REVERSAL_ALERTED_STOCKS
+    if not ENABLE_FII_REVERSAL:
+        return []
+
+    signals  = []
+    # Scan stocks where FII is accumulating (most likely to be exhausted / reversed)
+    pool = list(FII_DII_STRONG_BUY.union(
+        getattr(globals().get('FII_DII_TREND_FII_BUY_DII_SELL', set()), '__iter__', lambda: iter([]))()
+    ))[:FII_REVERSAL_MAX_SYMBOLS]
+
+    for key in pool:
+        if key not in R3_LEVELS:
+            continue
+        if key in FII_REVERSAL_ALERTED_STOCKS:
+            continue
+
+        info   = R3_LEVELS[key]
+        symbol = info.get('symbol', key)
+
+        try:
+            df5 = fetch_5min_cached(access_token, key, bars=300, symbol=symbol)
+            if df5 is None or len(df5) < 60:
+                continue
+
+            df1h = resample_to_1h(df5)
+            if df1h is None or len(df1h) < 8:
+                continue
+
+            df1h = compute_ha_1h(df1h)
+            df1h = add_ema_indicators_1h(df1h)
+
+            if len(df1h) < 3:
+                continue
+
+            c = df1h.iloc[-2]   # last completed bar
+            p = df1h.iloc[-3]   # bar before that
+
+            break_low   = c['low']      < p['low']
+            ha_red      = c['ha_color'] == 'red'
+            ema_cross   = (p['ema_fast'] >= p['ema_slow']) and (c['ema_fast'] < c['ema_slow'])
+            below_trend = c['ha_close'] < c['ema_trend']
+
+            live         = live_data.get(key, {})
+            avg_vol      = info.get('avg_volume_20d') or info.get('avg_volume', 1) or 1
+            volume_ratio = live.get('volume', 0) / avg_vol
+
+            if break_low and ha_red and ema_cross and below_trend and volume_ratio >= FII_REVERSAL_MIN_VOLUME_RATIO:
+                FII_REVERSAL_ALERTED_STOCKS.add(key)
+                signals.append({
+                    'symbol':            symbol,
+                    'instrument_key':    key,
+                    'current_price':     live.get('ltp'),
+                    'level':             c['low'],
+                    'breakout_type':     'PE',
+                    'strategy':          FII_REVERSAL_STRATEGY_NAME,
+                    'volume_ratio':      round(volume_ratio, 2),
+                    'timestamp':         now_ist(),
+                    'klinger_confirmed': True,
+                })
+                if DEBUG_MODE:
+                    print(f"🔴 FII_REVERSAL_SHORT candidate: {symbol} | vol {volume_ratio:.2f}x")
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ detect_fii_reversal [{symbol}]: {e}")
+
+    return signals
+
+
+def detect_fii_reversal_long(access_token, live_data):
+    """
+    FII Trend Reversal LONG Setup (Bullish counterpart).
+
+    Scans stocks where FII is SELLING (STRONG_SELL / FII_SELL_DII_BUY) but price
+    shows a 1-hour bullish reversal pattern — a 'capitulation low' or 'DII support'
+    setup where institutional selling is exhausting:
+
+    Entry conditions (all must be true on the *completed* H1 bar, i.e. iloc[-2]):
+      1. Break High : current H1 bar's high > previous H1 bar's high
+      2. Green HA   : ha_color == 'green'
+      3. EMA Bull X : ema_fast crosses above ema_slow (prev: fast <= slow, now: fast > slow)
+      4. Above trend: ha_close > ema_trend
+      5. Volume     : live volume ≥ FII_REVERSAL_LONG_MIN_VOLUME_RATIO × avg_volume_20d
+
+    Each symbol alerts at most once per session (FII_REVERSAL_LONG_ALERTED_STOCKS).
+    """
+    global FII_REVERSAL_LONG_ALERTED_STOCKS
+    if not ENABLE_FII_REVERSAL_LONG:
+        return []
+
+    signals  = []
+    # Scan stocks where FII is distributing — price reversal here = high-conviction long
+    pool = list(FII_DII_STRONG_SELL.union(FII_DII_TREND_FII_SELL_DII_BUY))[:FII_REVERSAL_LONG_MAX_SYMBOLS]
+
+    for key in pool:
+        if key not in R3_LEVELS:
+            continue
+        if key in FII_REVERSAL_LONG_ALERTED_STOCKS:
+            continue
+
+        info   = R3_LEVELS[key]
+        symbol = info.get('symbol', key)
+
+        try:
+            df5 = fetch_5min_cached(access_token, key, bars=300, symbol=symbol)
+            if df5 is None or len(df5) < 60:
+                continue
+
+            df1h = resample_to_1h(df5)
+            if df1h is None or len(df1h) < 8:
+                continue
+
+            df1h = compute_ha_1h(df1h)
+            df1h = add_ema_indicators_1h(df1h)
+
+            if len(df1h) < 3:
+                continue
+
+            c = df1h.iloc[-2]   # last completed bar
+            p = df1h.iloc[-3]   # bar before that
+
+            break_high  = c['high']     > p['high']
+            ha_green    = c['ha_color'] == 'green'
+            ema_cross   = (p['ema_fast'] <= p['ema_slow']) and (c['ema_fast'] > c['ema_slow'])
+            above_trend = c['ha_close'] > c['ema_trend']
+
+            live         = live_data.get(key, {})
+            avg_vol      = info.get('avg_volume_20d') or info.get('avg_volume', 1) or 1
+            volume_ratio = live.get('volume', 0) / avg_vol
+
+            if break_high and ha_green and ema_cross and above_trend and volume_ratio >= FII_REVERSAL_LONG_MIN_VOLUME_RATIO:
+                FII_REVERSAL_LONG_ALERTED_STOCKS.add(key)
+                signals.append({
+                    'symbol':            symbol,
+                    'instrument_key':    key,
+                    'current_price':     live.get('ltp'),
+                    'level':             c['high'],
+                    'breakout_type':     'CE',
+                    'strategy':          FII_REVERSAL_LONG_STRATEGY_NAME,
+                    'volume_ratio':      round(volume_ratio, 2),
+                    'timestamp':         now_ist(),
+                    'klinger_confirmed': True,
+                })
+                if DEBUG_MODE:
+                    print(f"🟢 FII_REVERSAL_LONG candidate: {symbol} | vol {volume_ratio:.2f}x")
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ detect_fii_reversal_long [{symbol}]: {e}")
+
+    return signals
+
 def enhanced_monitor(access_token, keys, symbols):
     """Main monitoring loop with all strategies including Klinger, Caching, and Exit Management"""
     print("📡 STARTING REAL-TIME MONITORING WITH INTELLIGENT CACHING...")
@@ -9504,6 +10072,31 @@ def enhanced_monitor(access_token, keys, symbols):
                 
                 # R3/S3/Box/Range Logic (only if not stopped)
                 if not TRADING_STOPPED:
+
+                    # === FII TREND REVERSAL (Short + Long) ===
+                    # Runs once per iteration; each symbol fires at most once per session.
+                    if ENABLE_FII_REVERSAL:
+                        reversal_signals = detect_fii_reversal(access_token, live_data)
+                        for sig in reversal_signals:
+                            print(f"\n{'='*80}")
+                            print(f"🔴 FII REVERSAL SHORT ALERT → {sig['symbol']}")
+                            print(f"   1H Break Low + Red HA + EMA Bearish | Vol {sig['volume_ratio']}x")
+                            print(f"   Level: ₹{sig['level']:.2f} | LTP: ₹{sig.get('current_price') or 0:.2f}")
+                            print(f"{'='*80}")
+                            if trader:
+                                place_breakout_order(sig, trader)
+
+                    if ENABLE_FII_REVERSAL_LONG:
+                        long_signals = detect_fii_reversal_long(access_token, live_data)
+                        for sig in long_signals:
+                            print(f"\n{'='*80}")
+                            print(f"🟢 FII REVERSAL LONG ALERT → {sig['symbol']}")
+                            print(f"   1H Break High + Green HA + EMA Bullish | Vol {sig['volume_ratio']}x")
+                            print(f"   Level: ₹{sig['level']:.2f} | LTP: ₹{sig.get('current_price') or 0:.2f}")
+                            print(f"{'='*80}")
+                            if trader:
+                                place_breakout_order(sig, trader)
+
                     for key, live in live_data.items():
                         if key in R3_LEVELS:
                             # R3 Breakout
