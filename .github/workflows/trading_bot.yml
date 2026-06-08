@@ -122,18 +122,39 @@ jobs:
           UPSTOX_API_SECRET: ${{ secrets.UPSTOX_API_SECRET }}
           UPSTOX_TOKEN:      ${{ secrets.UPSTOX_TOKEN }}
           GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
+          GH_TOKEN:          ${{ secrets.GH_PAT }}
           DISPLAY: ':99'
         run: |
-          # Start virtual display for Chrome
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
 
-          # Crash-logger wrapper: any unhandled exception is written to
-          # crash_log.txt before exit so the artifact upload always gives
-          # you a downloadable traceback even on startup crashes.
+          # ── Early token sync (background) ──────────────────────────────────
+          # Polls upstox_token.txt every 15 s for up to 10 min.
+          # As soon as the bot writes a fresh OAuth token, pushes it to
+          # Final-ORB-Only and upstox-bot so those bots (starting 7–14 min
+          # later) can use it directly without running Selenium OAuth themselves.
+          (
+            LAST=""
+            for i in $(seq 1 40); do
+              sleep 15
+              if [ -s upstox_token.txt ]; then
+                CURRENT=$(cat upstox_token.txt | tr -d '[:space:]')
+                if [ ${#CURRENT} -gt 100 ] && [ "$CURRENT" != "$LAST" ]; then
+                  LAST="$CURRENT"
+                  echo "[early-sync] New token detected (len=${#CURRENT}), pushing to all repos..."
+                  gh secret set UPSTOX_TOKEN --body "$CURRENT" --repo frzkhn155-ai/Final          2>&1 | sed 's/^/[early-sync] /'
+                  gh secret set UPSTOX_TOKEN --body "$CURRENT" --repo frzkhn155-ai/Final-ORB-Only 2>&1 | sed 's/^/[early-sync] /'
+                  gh secret set UPSTOX_TOKEN --body "$CURRENT" --repo frzkhn155-ai/upstox-bot     2>&1 | sed 's/^/[early-sync] /'
+                  echo "[early-sync] ✅ UPSTOX_TOKEN synced to all 3 repos at $(date '+%H:%M:%S IST')"
+                fi
+              fi
+            done
+          ) &
+          SYNC_PID=$!
+
+          # ── Run the bot ────────────────────────────────────────────────────
           python - <<'PYEOF'
           import traceback, sys, runpy
-
           try:
               runpy.run_path("Both4withcache10_headless.py", run_name="__main__")
           except SystemExit as e:
@@ -146,19 +167,20 @@ jobs:
               sys.exit(1)
           PYEOF
 
-      # ── 10. Sync fresh token to BOTH repos ───────────────────────────────
-      # If the bot generated a new OAuth token this run, push it to the
-      # UPSTOX_TOKEN secret in both repos so the other bot picks it up
-      # tomorrow without having to re-run OAuth.
-      # Requires a PAT secret GH_PAT with repo scope (Settings → Secrets → Actions).
-      - name: Sync token to both repos
+          kill $SYNC_PID 2>/dev/null || true
+
+      # ── 10. Sync token to all repos (end-of-day safety net) ──────────────
+      # Belt-and-suspenders: the early-sync background loop above handles the
+      # morning sync within minutes of token acquisition. This step is a
+      # safety net that ensures the token is synced even if the early loop
+      # somehow missed it (e.g. token was read from cache, not written fresh).
+      - name: Sync token to all repos
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "⚠️  GH_PAT not set — skipping cross-repo token sync."
-            echo "   Add a PAT with repo scope as GH_PAT in both repos' secrets."
             exit 0
           fi
           TOKEN_VALUE=""
@@ -169,12 +191,11 @@ jobs:
             echo "⚠️  upstox_token.txt is empty — nothing to sync."
             exit 0
           fi
-          echo "✅ Syncing token (length: ${#TOKEN_VALUE}) to both repos..."
-          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" \
-            --repo frzkhn155-ai/Final
-          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" \
-            --repo frzkhn155-ai/Final-ORB-Only
-          echo "✅ UPSTOX_TOKEN updated in both repositories."
+          echo "✅ End-of-day sync: token (len=${#TOKEN_VALUE}) → all 3 repos"
+          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/Final
+          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/Final-ORB-Only
+          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/upstox-bot
+          echo "✅ UPSTOX_TOKEN updated in all repositories."
 
       # ── 12. Save updated token for next run ───────────────────────────────
       - name: Save Upstox token (post-run)
