@@ -145,7 +145,7 @@ jobs:
                   gh secret set UPSTOX_TOKEN --body "$CURRENT" --repo frzkhn155-ai/Final          2>&1 | sed 's/^/[early-sync] /'
                   gh secret set UPSTOX_TOKEN --body "$CURRENT" --repo frzkhn155-ai/Final-ORB-Only 2>&1 | sed 's/^/[early-sync] /'
                   gh secret set UPSTOX_TOKEN --body "$CURRENT" --repo frzkhn155-ai/upstox-bot     2>&1 | sed 's/^/[early-sync] /'
-                  echo "[early-sync] ✅ UPSTOX_TOKEN synced to all 3 repos at $(date '+%H:%M:%S IST')"
+                  echo "[early-sync] ✅ UPSTOX_TOKEN synced to all 3 repos at $(TZ='Asia/Kolkata' date '+%H:%M:%S') IST"
                 fi
               fi
             done
