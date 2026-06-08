@@ -139,7 +139,7 @@ jobs:
               sleep 15
               if [ -s upstox_token.txt ]; then
                 CURRENT=$(cat upstox_token.txt | tr -d '[:space:]')
-                if [ ${#CURRENT} -gt 100 ] && [ "$CURRENT" != "$LAST" ]; then
+                if [ ${#CURRENT} -gt 450 ] && [ "$CURRENT" != "$LAST" ]; then
                   LAST="$CURRENT"
                   echo "[early-sync] New token detected (len=${#CURRENT}), pushing to all repos..."
                   gh secret set UPSTOX_TOKEN --body "$CURRENT" --repo frzkhn155-ai/Final          2>&1 | sed 's/^/[early-sync] /'

@@ -3817,12 +3817,14 @@ def send_orb_reversal_alert(signal, trader=None):
         print(f"⚠️ ORB order limit reached ({ORB_ORDER_COUNT}/{MAX_ORDERS_PER_DAY}) — reversal signal logged only")
 
 
+def initialize_orb_csv_files():
+    """Create ORB signal and trade CSV files with headers if they don't exist."""
     csv_files = [
-        (ORB_SIGNALS_FILE, ['Timestamp', 'Symbol', 'Signal_Type', 'Direction', 
-                           'Breakout_Level', 'Stop_Level', 'Target_Level', 
-                           'Body_Percent', 'Risk_Reward', 'FII_DII_Signal', 'Confidence']),
-        (ORB_TRADES_FILE, ['Timestamp', 'Symbol', 'Action', 'Direction', 'Price', 
-                          'Stop_Loss', 'Target', 'Volume_Ratio', 'Confidence', 'FII_DII_Signal'])
+        (ORB_SIGNALS_FILE, ['Timestamp', 'Symbol', 'Signal_Type', 'Direction',
+                            'Breakout_Level', 'Stop_Level', 'Target_Level',
+                            'Body_Percent', 'Risk_Reward', 'FII_DII_Signal', 'Confidence']),
+        (ORB_TRADES_FILE,  ['Timestamp', 'Symbol', 'Action', 'Direction', 'Price',
+                            'Stop_Loss', 'Target', 'Volume_Ratio', 'Confidence', 'FII_DII_Signal'])
     ]
     for csv_file, headers in csv_files:
         if not os.path.exists(csv_file):
