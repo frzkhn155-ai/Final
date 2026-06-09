@@ -109,7 +109,7 @@ VOLUME_SPIKE_THRESHOLD = 1.3
 VOLUME_LOOKBACK_DAYS = 20
 USE_DYNAMIC_VOLUME_THRESHOLD = True
 MAX_WORKERS = 3
-DEBUG_MODE = False                     # <-- changed to True
+DEBUG_MODE = True                      # enables ⛔ ORB reversal rejection prints
 BATCH_SIZE = 100
 MAX_INSTRUMENTS_PER_BATCH = 500
 
@@ -3885,7 +3885,7 @@ def check_orb_time_and_process(access_token, live_data):
           and now < cutoff):
         process_first_candles(access_token, live_data, late_pass=True)
 
-def monitor_orb_breakouts(live_data, trader=None):
+def monitor_orb_breakouts(live_data, access_token='', trader=None):
     if not ENABLE_ORB_STRATEGY or not ORB_SIGNALS:
         return
     for symbol_key, data in live_data.items():
@@ -3904,9 +3904,7 @@ def monitor_orb_breakouts(live_data, trader=None):
 
             # ── ORB Reversal check: price moving against original signal ──────
             if ORB_ENABLE_REVERSAL_TRADE and symbol not in ORB_REVERSAL_ALERTED:
-                # access_token is not passed to monitor_orb_breakouts; retrieve from module-level
-                _access_token = globals().get('ACCESS_TOKEN', '')
-                reversal = check_orb_reversal(symbol, ltp, volume, data, _access_token, trader)
+                reversal = check_orb_reversal(symbol, ltp, volume, data, access_token, trader)
                 if reversal:
                     send_orb_reversal_alert(reversal, trader)
         except Exception as e:
@@ -8385,8 +8383,11 @@ def _ha_analyse_symbol(access_token: str, symbol: str, ikey: str, signal: str):
     last_body  = abs(ha['ha_close'].iloc[-1] - ha['ha_open'].iloc[-1])
     is_doji    = (last_range > 0) and (last_body / last_range < 0.20)
 
-    is_bearish_flip = (c_prev1 == 'red'   and c_last == 'red')
-    is_bullish_flip = (c_prev1 == 'green' and c_last == 'green')
+    # A flip = previous candle is opposite colour AND last candle is the new colour.
+    # Original code required c_prev1 AND c_last both same colour — that's "trend
+    # continuation", not a "flip". A reversal signal needs a CHANGE of colour.
+    is_bearish_flip = (c_prev1 == 'green' and c_last == 'red')
+    is_bullish_flip = (c_prev1 == 'red'   and c_last == 'green')
     needs_alert     = (
         (signal == 'LONG'  and is_bearish_flip) or
         (signal == 'SHORT' and is_bullish_flip)
@@ -10023,7 +10024,7 @@ def enhanced_monitor(access_token, keys, symbols):
                 # Check ORB time and process if needed
                 if ENABLE_ORB_STRATEGY:
                     check_orb_time_and_process(access_token, live_data)
-                    monitor_orb_breakouts(live_data, trader)
+                    monitor_orb_breakouts(live_data, access_token, trader)
                 
                 # Update FII/DII if needed
                 if ENABLE_FII_DII_FILTER:
