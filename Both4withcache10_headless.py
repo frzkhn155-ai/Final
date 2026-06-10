@@ -336,7 +336,7 @@ ORB_REVERSAL_MIN_MOVE_PCT    = 0.4    # Price must have moved ≥0.4% against si
 ORB_REVERSAL_CANDLES_MIN     = 2      # Wait at least 2 candles after ORB signal before checking reversal
 ORB_REVERSAL_REQUIRE_HA      = True   # Require HA colour flip (via check_ha_reversal_alerts) for reversal
 ORB_REVERSAL_REQUIRE_TOPPING = True   # Require detect_topping_reversal confirmation for bearish→bullish flip
-ORB_REVERSAL_WINDOW_MINUTES  = 45     # Only fire reversal within 45 min of original ORB signal
+ORB_REVERSAL_WINDOW_MINUTES  = 90     # Fire reversal up to 90 min after original ORB signal
 
 # File paths for ORB logging
 ORB_SIGNALS_FILE = "orb_signals.csv"
@@ -3620,27 +3620,40 @@ def check_orb_reversal(symbol, ltp, volume, live_data, access_token, trader=None
             print(f"⛔ ORB reversal: {symbol} adverse move {adverse_move_pct:.2f}% < min {ORB_REVERSAL_MIN_MOVE_PCT}%")
         return None
 
-    # ── Fetch 5-min candle data for technical analysis ────────────────────────
+    # ── Resolve instrument key EARLY (needed for candle fetch + Klinger) ──────
+    ikey = orb.get('instrument_key') or SYMBOL_TO_ISIN.get(symbol, '')
+    klinger_info = R3_LEVELS.get(ikey, {}).get('klinger') if ikey else None
+
+    # ── Fetch 5-min candle data (history + real-time merged) ─────────────────
+    # CRITICAL: get_realtime_5min_df() reads ONLY from REALTIME_CANDLES (live
+    # tick builder). It starts empty at 09:15 and adds 1 bar every 5 minutes.
+    # Timeline vs requirements:
+    #   09:20 → 0-1 bars  → returns None (min_bars=10 fails)
+    #   10:05 → ~10 bars  → reversal window EXPIRES at this exact moment
+    #   11:00 → ~25 bars  → Bollinger works, but window expired 55 min ago
+    # Result: reversal can NEVER fire using get_realtime_5min_df.
+    #
+    # fetch_5min_cached() merges ChartInk historical base (~50 bars from
+    # yesterday + today 09:15 onwards) with real-time bars. This gives
+    # enough bars for Bollinger bands (needs 25) from market open.
     try:
-        df = get_realtime_5min_df(symbol, min_bars=10)
-        if df is None or len(df) < 5:
+        df = fetch_5min_cached(access_token, ikey, bars=60, symbol=symbol)
+        n = len(df) if df is not None else 0
+        if df is None or n < 5:
             if DEBUG_MODE:
-                print(f"⛔ ORB reversal: {symbol} insufficient candle data")
+                print(f"⛔ ORB reversal: {symbol} insufficient candle data "
+                      f"(fetch_5min_cached returned {n} bars)")
             return None
     except Exception as e:
         if DEBUG_MODE:
             print(f"⛔ ORB reversal: {symbol} candle fetch error: {e}")
         return None
 
-    candle_count_since_signal = len(df)
-    if candle_count_since_signal < ORB_REVERSAL_CANDLES_MIN:
+    if len(df) < ORB_REVERSAL_CANDLES_MIN:
         if DEBUG_MODE:
-            print(f"⛔ ORB reversal: {symbol} too few candles since signal ({candle_count_since_signal} < {ORB_REVERSAL_CANDLES_MIN})")
+            print(f"⛔ ORB reversal: {symbol} too few candles "
+                  f"({len(df)} < {ORB_REVERSAL_CANDLES_MIN})")
         return None
-
-    # ── Klinger data for confirmation functions ───────────────────────────────
-    ikey = orb.get('instrument_key') or SYMBOL_TO_ISIN.get(symbol, '')
-    klinger_info = R3_LEVELS.get(ikey, {}).get('klinger') if ikey else None
 
     # ── Gate 1: detect_topping_reversal (for BEARISH→BULLISH, check lower band bounce) ──
     # For a BULLISH→BEARISH reversal, detect_topping_reversal directly fits.
