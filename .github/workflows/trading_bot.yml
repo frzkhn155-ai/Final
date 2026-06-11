@@ -1,15 +1,6 @@
 name: Upstox Trading Bot
 
-# ───────────────────────────────────────────────────────────────────────────────
-# TRIGGERS
-# • Schedule : runs automatically at 09:10 IST (03:40 UTC) on weekdays
-# • Manual   : Actions tab → "Upstox Trading Bot" → "Run workflow"
-# ───────────────────────────────────────────────────────────────────────────────
 on:
-  schedule:
-    # 03:40 UTC = 09:10 IST (5 min before NSE market open) — Mon–Fri only
-    - cron: '40 3 * * 1-5'
-
   workflow_dispatch:
     inputs:
       reason:
@@ -18,7 +9,6 @@ on:
         default: 'Manual trigger'
 
 env:
-  # Opt into Node.js 24 now — GitHub forces it on June 2, 2026
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
@@ -40,19 +30,12 @@ jobs:
           cache: 'pip'
 
       # ── 3. Install system dependencies ────────────────────────────────────
-      # xclip/xdotool: required by pyperclip (imported in the trading script).
-      # Without this, pyperclip raises an exception on headless Linux and the
-      # bot crashes within ~40 seconds with no log files produced.
       - name: Install system dependencies
         run: |
           sudo apt-get update -q
           sudo apt-get install -y xclip xdotool
 
-      # ── 4. Install Google Chrome (modern, non-deprecated method) ──────────
-      # ROOT CAUSE FIX: ubuntu-latest is now Ubuntu 24.04, which removed the
-      # old `apt-key` command used in the previously working workflow.
-      # The old method silently failed → Chrome was not installed → Selenium
-      # crashed the bot at startup (exit code 1, ~40s runtime, no log files).
+      # ── 4. Install Google Chrome ──────────────────────────────────────────
       - name: Install Google Chrome
         run: |
           sudo install -m 0755 -d /etc/apt/keyrings
@@ -67,12 +50,10 @@ jobs:
           google-chrome --version
 
       # ── 5. Install Python dependencies ────────────────────────────────────
-      # NOTE: requirements.txt was corrupted — selenium + webdriver-manager
-      # were listed 17 times each. This has been fixed in the cleaned file.
       - name: Install Python packages
         run: pip install -r requirements.txt
 
-      # ── 6. Restore cached candle data (speeds up re-runs) ─────────────────
+      # ── 6. Restore cached candle data ─────────────────────────────────────
       - name: Restore candle cache
         uses: actions/cache@v4
         with:
@@ -82,11 +63,6 @@ jobs:
             candle-cache-${{ runner.os }}-
 
       # ── 7. Restore saved Upstox token ─────────────────────────────────────
-      # GitHub Actions cache entries expire after 7 days of no access.
-      # If the bot fails again with a short runtime after this fix:
-      #   1. Log into Upstox → complete OAuth in your browser
-      #   2. Copy the access_token
-      #   3. Repo → Settings → Secrets → Actions → update UPSTOX_TOKEN
       - name: Restore Upstox token
         uses: actions/cache@v4
         with:
@@ -106,7 +82,6 @@ jobs:
           if [ -z "$UPSTOX_TOKEN" ]; then
             echo "⚠️  WARNING: UPSTOX_TOKEN secret is empty."
             echo "   The bot will fall back to Selenium OAuth login."
-            echo "   If that also fails, refresh the token and update the secret."
           else
             echo "✅ UPSTOX_TOKEN is set (length: ${#UPSTOX_TOKEN} chars)"
           fi
@@ -127,32 +102,6 @@ jobs:
         run: |
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
-
-          # ── Early token sync (background) ──────────────────────────────────
-          # Polls upstox_token.txt every 15 s for up to 10 min.
-          # As soon as the bot writes a fresh OAuth token, pushes it to
-          # Final-ORB-Only and upstox-bot so those bots (starting 7–14 min
-          # later) can use it directly without running Selenium OAuth themselves.
-          (
-            LAST=""
-            for i in $(seq 1 40); do
-              sleep 15
-              if [ -s upstox_token.txt ]; then
-                CURRENT=$(cat upstox_token.txt | tr -d '[:space:]')
-                if [ ${#CURRENT} -gt 450 ] && [ "$CURRENT" != "$LAST" ]; then
-                  LAST="$CURRENT"
-                  echo "[early-sync] New token detected (len=${#CURRENT}), pushing to all repos..."
-                  gh secret set UPSTOX_TOKEN --body "$CURRENT" --repo frzkhn155-ai/Final          2>&1 | sed 's/^/[early-sync] /'
-                  gh secret set UPSTOX_TOKEN --body "$CURRENT" --repo frzkhn155-ai/Final-ORB-Only 2>&1 | sed 's/^/[early-sync] /'
-                  gh secret set UPSTOX_TOKEN --body "$CURRENT" --repo frzkhn155-ai/upstox-bot     2>&1 | sed 's/^/[early-sync] /'
-                  echo "[early-sync] ✅ UPSTOX_TOKEN synced to all 3 repos at $(TZ='Asia/Kolkata' date '+%H:%M:%S') IST"
-                fi
-              fi
-            done
-          ) &
-          SYNC_PID=$!
-
-          # ── Run the bot ────────────────────────────────────────────────────
           python - <<'PYEOF'
           import traceback, sys, runpy
           try:
@@ -167,13 +116,7 @@ jobs:
               sys.exit(1)
           PYEOF
 
-          kill $SYNC_PID 2>/dev/null || true
-
-      # ── 10. Sync token to all repos (end-of-day safety net) ──────────────
-      # Belt-and-suspenders: the early-sync background loop above handles the
-      # morning sync within minutes of token acquisition. This step is a
-      # safety net that ensures the token is synced even if the early loop
-      # somehow missed it (e.g. token was read from cache, not written fresh).
+      # ── 10. Sync token to all repos (end-of-day) ──────────────────────────
       - name: Sync token to all repos
         if: always()
         env:
@@ -191,13 +134,13 @@ jobs:
             echo "⚠️  upstox_token.txt is empty — nothing to sync."
             exit 0
           fi
-          echo "✅ End-of-day sync: token (len=${#TOKEN_VALUE}) → all 3 repos"
+          echo "✅ Syncing token (len=${#TOKEN_VALUE}) → all 3 repos"
           gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/Final
           gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/Final-ORB-Only
           gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/upstox-bot
           echo "✅ UPSTOX_TOKEN updated in all repositories."
 
-      # ── 12. Save updated token for next run ───────────────────────────────
+      # ── 11. Save updated token for next run ───────────────────────────────
       - name: Save Upstox token (post-run)
         if: always()
         uses: actions/cache@v4
@@ -208,7 +151,7 @@ jobs:
             token_timestamp.json
           key: upstox-token-${{ runner.os }}
 
-      # ── 13. Upload all log / CSV files as artifacts ───────────────────────
+      # ── 12. Upload all log / CSV files as artifacts ───────────────────────
       - name: Upload trading logs
         if: always()
         uses: actions/upload-artifact@v4
