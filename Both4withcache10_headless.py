@@ -10412,7 +10412,17 @@ def enhanced_monitor(access_token, keys, symbols):
             clear_intraday_cache()
             
             # Heartbeat - always visible so you know the bot is alive
-            print(f"\n🔄 Scan #{scan_count} | {current_time.strftime('%H:%M:%S')} | Orders today: {DAILY_ORDER_COUNT+BOX_ORDER_COUNT+RANGE_ORDER_COUNT+GAP_ORDER_COUNT+FAST_TRADE_ORDER_COUNT+ORB_ORDER_COUNT}", flush=True)
+            # Determine active session phase for heartbeat
+            _ct_str = current_time.strftime('%H:%M')
+            if _ct_str < "10:30":
+                _phase = "🔵 ORB"
+            elif _ct_str < "13:00":
+                _phase = "📦 MIDDAY-BOX"
+            elif _ct_str <= "15:15":
+                _phase = "🌆 AFTERNOON-PIVOT"
+            else:
+                _phase = "🔒 POST-MARKET"
+            print(f"\n🔄 Scan #{scan_count} | {current_time.strftime('%H:%M:%S')} | {_phase} | Orders today: {DAILY_ORDER_COUNT+BOX_ORDER_COUNT+RANGE_ORDER_COUNT+GAP_ORDER_COUNT+FAST_TRADE_ORDER_COUNT+ORB_ORDER_COUNT}", flush=True)
             
             # Check if trading should be stopped
             if TRADING_STOPPED:
