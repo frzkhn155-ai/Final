@@ -24,6 +24,15 @@ except ImportError:
     def start_ai_assistant(*a, **kw): pass
     def ai_status(): return "AI Assistant: ai_assistant.py not found"
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── Reversal strategy (opening-range reversal — see reversal_strategy.py) ──────
+try:
+    from reversal_strategy import find_latest_reversal_signal
+    _REVERSAL_IMPORT_OK = True
+except ImportError:
+    _REVERSAL_IMPORT_OK = False
+    def find_latest_reversal_signal(*a, **kw): return None
+# ─────────────────────────────────────────────────────────────────────────────
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo          # stdlib, Python 3.9+
 from email.utils import parsedate_to_datetime
@@ -380,6 +389,20 @@ ORB_SIGNALS_FILE = "orb_signals.csv"
 ORB_TRADES_FILE  = "orb_trades.csv"
 ORB_LOG_FILE     = "orb_trading_log.txt"
 
+# ========== OPENING-RANGE REVERSAL STRATEGY CONFIG ==========
+# Standalone reversal detector (reversal_strategy.py): fires when price breaks
+# back through the opening range against its initial bias (exhaustion move).
+# Selected via the STRATEGY env var ("reversal" or "all"); see apply_strategy_selection().
+ENABLE_REVERSAL_STRATEGY      = False   # toggled on by STRATEGY=all/reversal
+ENABLE_REVERSAL_AUTO_TRADING  = False   # default: signal-only (no live orders)
+REVERSAL_OPENING_RANGE_BARS   = 3       # first 3 x 5min bars = ~15min opening range
+REVERSAL_THRESHOLD_PERCENT    = 0.5     # % of OR range price must exceed to confirm
+REVERSAL_MIN_VOLUME           = 0       # per-bar volume floor (0 = disabled)
+REVERSAL_MIN_BARS             = REVERSAL_OPENING_RANGE_BARS + 5  # candles before scanning
+REVERSAL_MAX_SYMBOLS          = 40      # cap symbols scanned per cycle
+REVERSAL_SCAN_INTERVAL_SCANS  = 4       # run reversal scan every N main-loop scans
+REVERSAL_SIGNALS_FILE         = "reversal_signals.csv"
+
 # ========== FII TREND REVERSAL SHORT (Bearish) CONFIG ==========
 ENABLE_FII_REVERSAL             = True
 FII_REVERSAL_MAX_SYMBOLS        = 30
@@ -528,6 +551,11 @@ ORB_ALERTED_STOCKS = set()   # fired ORB signal today
 ORB_ORDER_COUNT = 0
 ORB_PROCESSED_TODAY = False
 ORB_REVERSAL_ALERTED = set()   # symbols that already fired a reversal trade today (one per symbol)
+
+# Opening-range reversal strategy (reversal_strategy.py) globals
+REVERSAL_ALERTED = set()       # symbols that already fired an OR-reversal signal today
+REVERSAL_SIGNAL_COUNT = 0
+REVERSAL_ORDER_COUNT = 0
 
 # ── Midday Box global state ───────────────────────────────────────────────────
 # keyed by symbol; each entry tracks the live consolidation range 10:30–13:00
@@ -3925,6 +3953,7 @@ def check_orb_time_and_process(access_token, live_data):
         ORB_PROCESSED_TODAY = False
         ORB_LATE_CHECKED.clear()
         ORB_REVERSAL_ALERTED.clear()   # reset reversal tracker each morning
+        REVERSAL_ALERTED.clear()       # reset OR-reversal tracker each morning
         MIDDAY_BOX_STATE.clear()       # fresh box each day
         MIDDAY_BOX_ALERTED.clear()
         AFTERNOON_ALERTED.clear()
@@ -4001,6 +4030,180 @@ def print_orb_summary():
         print(f"  Bullish Setups:  {bullish}")
         print(f"  Bearish Setups:  {bearish}")
     print(f"{'='*100}\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OPENING-RANGE REVERSAL STRATEGY (reversal_strategy.py integration)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _reversal_candles_from_df(df):
+    """Convert a 5min OHLCV DataFrame (date/open/high/low/close/volume) into the
+    list[dict] shape that reversal_strategy.find_latest_reversal_signal expects."""
+    if df is None or len(df) == 0:
+        return []
+    candles = []
+    for _, row in df.iterrows():
+        candles.append({
+            "timestamp": str(row.get("date", "")),
+            "open":   row.get("open", 0),
+            "high":   row.get("high", 0),
+            "low":    row.get("low", 0),
+            "close":  row.get("close", 0),
+            "volume": row.get("volume", 0),
+        })
+    return candles
+
+
+def _log_reversal_signal(signal):
+    """Append one reversal signal to REVERSAL_SIGNALS_FILE (own schema)."""
+    header = ['Timestamp', 'Symbol', 'Signal_Type', 'Close', 'Strength',
+              'Reason', 'OR_High', 'OR_Low']
+    file_exists = os.path.exists(REVERSAL_SIGNALS_FILE)
+    try:
+        with open(REVERSAL_SIGNALS_FILE, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(header)
+            writer.writerow([
+                now_ist().strftime('%Y-%m-%d %H:%M:%S'),
+                signal.get('symbol', ''),
+                signal.get('signal_type', ''),
+                f"{float(signal.get('close', 0)):.2f}",
+                f"{float(signal.get('strength', 0)):.0f}",
+                signal.get('reason', ''),
+                f"{float(signal.get('or_high', 0)):.2f}",
+                f"{float(signal.get('or_low', 0)):.2f}",
+            ])
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⚠️ reversal log error: {e}")
+
+
+def _place_reversal_order(signal, symbol, instrument_key, trader):
+    """Place an option order for a reversal signal (REVERSAL_DOWN→PE, REVERSAL_UP→CE).
+    Only invoked when ENABLE_REVERSAL_AUTO_TRADING is True."""
+    global REVERSAL_ORDER_COUNT
+    if REVERSAL_ORDER_COUNT >= MAX_ORDERS_PER_DAY:
+        print(f"⏭️  Reversal {symbol}: daily order cap reached "
+              f"({REVERSAL_ORDER_COUNT}/{MAX_ORDERS_PER_DAY})")
+        return
+    breakout_type = 'PE' if signal.get('signal_type') == 'REVERSAL_DOWN' else 'CE'
+    print(f"\n📤 Placing REVERSAL {breakout_type} order for {symbol}...")
+    order = place_breakout_order({
+        'symbol':         symbol,
+        'instrument_key': instrument_key,
+        'breakout_type':  breakout_type,
+        'strategy':       'REVERSAL',
+        'entry_price':    signal.get('close', 0),
+    }, trader)
+    if order:
+        REVERSAL_ORDER_COUNT += 1
+        print(f"✅ Reversal order placed: {order.get('order_id')} | {symbol} {breakout_type}")
+    else:
+        print(f"⚠️ Reversal order failed for {symbol}")
+
+
+def run_reversal_strategy_scan(access_token, live_data, trader=None):
+    """STRATEGY=reversal/all — detect opening-range reversal signals on the live
+    5min candles built by update_realtime_candle() and log them.
+
+    Signal-only by default; order placement is gated behind ENABLE_REVERSAL_AUTO_TRADING.
+    Each symbol fires at most once per day (REVERSAL_ALERTED)."""
+    global REVERSAL_SIGNAL_COUNT
+    if not ENABLE_REVERSAL_STRATEGY or not _REVERSAL_IMPORT_OK or not live_data:
+        return
+
+    params = {
+        "opening_range_minutes":      REVERSAL_OPENING_RANGE_BARS,
+        "reversal_threshold_percent": REVERSAL_THRESHOLD_PERCENT,
+        "min_reversal_volume":        REVERSAL_MIN_VOLUME,
+    }
+
+    checked = 0
+    for symbol_key in live_data:
+        if checked >= REVERSAL_MAX_SYMBOLS:
+            break
+        symbol = ISIN_TO_SYMBOL.get(symbol_key, symbol_key)
+        if symbol in REVERSAL_ALERTED:
+            continue
+        df = get_realtime_5min_df(symbol, min_bars=REVERSAL_MIN_BARS)
+        if df is None:
+            continue
+        checked += 1
+        try:
+            signal = find_latest_reversal_signal(_reversal_candles_from_df(df), params=params)
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⚠️ reversal scan error {symbol}: {e}")
+            continue
+        if not signal:
+            continue
+
+        REVERSAL_ALERTED.add(symbol)
+        REVERSAL_SIGNAL_COUNT += 1
+        signal['symbol'] = symbol
+        _log_reversal_signal(signal)
+        print("\n" + "=" * 100)
+        print(f"🔁 REVERSAL SIGNAL: {symbol} — {signal['signal_type']}")
+        print(f"   {signal['reason']}")
+        print(f"   Close ₹{float(signal['close']):.2f} | Strength {float(signal['strength']):.0f}/100")
+        print("=" * 100)
+
+        if ENABLE_REVERSAL_AUTO_TRADING and trader and is_order_time_allowed():
+            _place_reversal_order(signal, symbol, symbol_key, trader)
+
+
+def print_reversal_summary():
+    if not ENABLE_REVERSAL_STRATEGY:
+        return
+    print(f"\n{'='*100}")
+    print("🔁 REVERSAL STRATEGY SUMMARY")
+    print(f"{'='*100}")
+    print(f"Reversal Signals Generated:  {REVERSAL_SIGNAL_COUNT}")
+    print(f"Reversal Symbols Alerted:    {len(REVERSAL_ALERTED)}")
+    print(f"Reversal Orders Placed:      {REVERSAL_ORDER_COUNT}")
+    print(f"{'='*100}\n")
+
+
+def apply_strategy_selection():
+    """Translate the STRATEGY env var (set by the GitHub Actions workflow dropdown)
+    onto the per-strategy ENABLE_* flags so the selector actually takes effect.
+
+    Supported values:
+      all (default) → every strategy enabled, plus reversal-signal logging
+      r3_s3 / box / range / gap / orb / reversal → run that strategy in isolation
+    """
+    g = globals()
+    sel = os.environ.get("STRATEGY", "all").strip().lower() or "all"
+
+    if sel == "all":
+        g['ENABLE_REVERSAL_STRATEGY'] = True
+        print("📊 STRATEGY=all → all strategies enabled (incl. reversal logging)")
+        return
+
+    groups = {
+        "r3_s3":    ["ENABLE_AUTO_TRADING"],
+        "box":      ["ENABLE_BOX_TRADING", "ENABLE_MIDDAY_BOX"],
+        "range":    ["ENABLE_RANGE_TRADING"],
+        "gap":      ["ENABLE_GAP_TRADING"],
+        "orb":      ["ENABLE_ORB_STRATEGY"],
+        "reversal": ["ENABLE_REVERSAL_STRATEGY"],
+    }
+
+    if sel not in groups:
+        g['ENABLE_REVERSAL_STRATEGY'] = True
+        print(f"⚠️  STRATEGY='{sel}' not recognised — defaulting to 'all'")
+        return
+
+    all_flags = ["ENABLE_AUTO_TRADING", "ENABLE_BOX_TRADING", "ENABLE_RANGE_TRADING",
+                 "ENABLE_GAP_TRADING", "ENABLE_ORB_STRATEGY", "ENABLE_FAST_TRADING",
+                 "ENABLE_FII_REVERSAL", "ENABLE_FII_REVERSAL_LONG",
+                 "ENABLE_MIDDAY_BOX", "ENABLE_AFTERNOON_PIVOT", "ENABLE_REVERSAL_STRATEGY"]
+    for flag in all_flags:
+        g[flag] = False
+    for flag in groups[sel]:
+        g[flag] = True
+    print(f"📊 STRATEGY='{sel}' → only {', '.join(groups[sel])} enabled")
+
 
 def get_token_via_android_oauth() -> str:
     """
@@ -9520,6 +9723,10 @@ def print_final_stats():
     # ORB Stats
     if ENABLE_ORB_STRATEGY:
         print_orb_summary()
+
+    # Reversal Stats
+    if ENABLE_REVERSAL_STRATEGY:
+        print_reversal_summary()
     
     if PLACED_ORDERS:
         print(f"\n📋 ALL ORDERS PLACED:")
@@ -10561,6 +10768,10 @@ def enhanced_monitor(access_token, keys, symbols):
                 if ENABLE_ORB_STRATEGY:
                     check_orb_time_and_process(access_token, live_data)
                     monitor_orb_breakouts(live_data, access_token, trader)
+
+                # Opening-range reversal scan (STRATEGY=reversal/all), throttled
+                if ENABLE_REVERSAL_STRATEGY and scan_count % REVERSAL_SCAN_INTERVAL_SCANS == 0:
+                    run_reversal_strategy_scan(access_token, live_data, trader)
                 
                 # Update FII/DII if needed
                 if ENABLE_FII_DII_FILTER:
@@ -10748,6 +10959,12 @@ def run_trading_bot(access_token):
             (ORB_TRADES_FILE, ['Timestamp', 'Symbol', 'Action', 'Direction', 'Price', 
                               'Stop_Loss', 'Target', 'Volume_Ratio', 'Confidence', 'FII_DII_Signal'])
         ])
+
+    if ENABLE_REVERSAL_STRATEGY:
+        csv_files_config.append(
+            (REVERSAL_SIGNALS_FILE, ['Timestamp', 'Symbol', 'Signal_Type', 'Close',
+                                     'Strength', 'Reason', 'OR_High', 'OR_Low'])
+        )
     
     for csv_file, headers in csv_files_config:
         if not os.path.exists(csv_file):
@@ -10843,7 +11060,10 @@ def main():
     print("UPSTOX AUTO-TRADING BOT WITH INTELLIGENT CACHING & ADVANCED STRATEGIES")
     print("="*120)
     print()
-    
+
+    # Step 0: Apply STRATEGY env selection (GitHub Actions workflow dropdown)
+    apply_strategy_selection()
+
     # Step 1: Get Upstox access token (smart fallback)
     token = get_upstox_token()
     

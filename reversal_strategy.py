@@ -3,17 +3,31 @@ Reversal-mode signal generator for integration with Both4withcache10_headless.py
 
 This module provides:
 - find_reversal_signals(candles, params=None) -> list[dict]
+- find_latest_reversal_signal(candles, params=None) -> dict | None
 - write_signals_csv(signals, filename='reversal_signals.csv')
+- append_to_orb_signals_csv(signal, filename='orb_signals.csv')
 
 A reversal signal is generated when price action contradicts the opening range direction.
 For example: if the market opened with bullish momentum (ORB_up), a reversal occurs when
 price drops back below the opening range, signaling potential exhaustion and downside momentum.
+
+The ``opening_range_minutes`` param is measured in *candles*, not wall-clock minutes:
+with 5-minute candles, ``opening_range_minutes=3`` represents the first 15 minutes.
 """
 
 import csv
 import os
-from datetime import datetime
 from typing import List, Dict, Optional
+
+
+def _num(value, default: float = 0.0) -> float:
+    """Coerce a candle field to float, tolerating None/str/missing values."""
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def find_reversal_signals(
@@ -54,9 +68,9 @@ def find_reversal_signals(
     
     # Extract opening range (first N candles)
     or_candles = candles[:opening_range_minutes]
-    or_high = max(c.get("high", c.get("close", 0)) for c in or_candles)
-    or_low = min(c.get("low", c.get("close", float("inf"))) for c in or_candles)
-    or_close = or_candles[-1].get("close", 0)
+    or_high = max(_num(c.get("high", c.get("close"))) for c in or_candles)
+    or_low = min(_num(c.get("low", c.get("close")), float("inf")) for c in or_candles)
+    or_close = _num(or_candles[-1].get("close"))
     
     # Determine opening range bias
     or_midpoint = (or_high + or_low) / 2
@@ -69,10 +83,10 @@ def find_reversal_signals(
     # Scan post-opening-range candles for reversals
     for i in range(opening_range_minutes, len(candles)):
         candle = candles[i]
-        current_close = candle.get("close", 0)
-        current_low = candle.get("low", current_close)
-        current_high = candle.get("high", current_close)
-        current_volume = candle.get("volume", 0)
+        current_close = _num(candle.get("close"))
+        current_low = _num(candle.get("low"), current_close)
+        current_high = _num(candle.get("high"), current_close)
+        current_volume = _num(candle.get("volume"))
         candle_time = candle.get("timestamp", "")
         
         if current_volume < min_volume:
@@ -111,6 +125,19 @@ def find_reversal_signals(
                 })
     
     return signals
+
+
+def find_latest_reversal_signal(
+    candles: List[Dict],
+    params: Optional[Dict] = None
+) -> Optional[Dict]:
+    """Return the most recent reversal signal (or None).
+
+    Convenience wrapper for live/streaming use: callers typically only care about
+    the latest qualifying candle rather than every historical reversal.
+    """
+    signals = find_reversal_signals(candles, params)
+    return signals[-1] if signals else None
 
 
 def write_signals_csv(
@@ -156,33 +183,59 @@ def append_to_orb_signals_csv(
     filename: str = "orb_signals.csv"
 ) -> None:
     """
-    Optional: append a reversal signal to the existing ORB signals CSV for unified logging.
-    This preserves your existing ORB CSV format while merging reversal output.
-    
+    Optional: append a reversal signal to an existing signals CSV for unified logging.
+
+    This is *schema-safe*: if ``filename`` already exists, its header row is read
+    and the reversal signal is mapped onto whatever columns that file uses (any
+    unknown columns are left blank). This prevents the column misalignment /
+    corruption that occurs when a fixed 5-column row is appended to a file with a
+    different header (e.g. the bot's 11-column ``orb_signals.csv``).
+
     Args:
         reversal_signal: A single signal dict from find_reversal_signals()
-        filename: Target CSV filename (should match your ORB signals CSV)
+        filename: Target CSV filename
     """
     if not reversal_signal:
         return
-    
-    # Transform reversal signal to match ORB CSV schema (adapt fieldnames as needed)
-    orb_row = {
-        "timestamp": reversal_signal.get("timestamp", ""),
-        "close": reversal_signal.get("close", ""),
+
+    # Canonical reversal fields, keyed by common header names (case-insensitive).
+    sig = {
+        "timestamp":   reversal_signal.get("timestamp", ""),
+        "symbol":      reversal_signal.get("symbol", ""),
+        "close":       reversal_signal.get("close", ""),
         "signal_type": reversal_signal.get("signal_type", "REVERSAL"),
-        "reason": reversal_signal.get("reason", ""),
-        "strength": reversal_signal.get("strength", ""),
+        "direction":   reversal_signal.get("signal_type", "REVERSAL"),
+        "reason":      reversal_signal.get("reason", ""),
+        "strength":    reversal_signal.get("strength", ""),
+        "or_high":     reversal_signal.get("or_high", ""),
+        "or_low":      reversal_signal.get("or_low", ""),
     }
-    
-    fieldnames = list(orb_row.keys())
+
     file_exists = os.path.isfile(filename)
-    
+
+    # If the target file already has a header, align to it so we never corrupt it.
+    existing_header = None
+    if file_exists:
+        try:
+            with open(filename, "r", newline="", encoding="utf-8") as f:
+                first_line = f.readline().strip()
+            if first_line:
+                existing_header = [h.strip() for h in first_line.split(",")]
+        except OSError:
+            existing_header = None
+
+    if existing_header:
+        fieldnames = existing_header
+        row = {col: sig.get(col.strip().lower(), "") for col in existing_header}
+    else:
+        fieldnames = ["timestamp", "symbol", "close", "signal_type", "reason", "strength"]
+        row = {col: sig.get(col, "") for col in fieldnames}
+
     try:
         with open(filename, "a" if file_exists else "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             if not file_exists:
                 writer.writeheader()
-            writer.writerow(orb_row)
+            writer.writerow(row)
     except Exception as e:
         print(f"⚠️ Could not append reversal signal to {filename}: {e}")
