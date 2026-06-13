@@ -16,6 +16,7 @@ on:
           - range
           - gap
           - orb
+          - reversal
       debug_mode:
         description: 'Enable debug output'
         required: false
