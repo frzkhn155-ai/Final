@@ -22,7 +22,12 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # AI Settings
 AI_ENABLED = True
-AI_MODEL = "llama-3.1-70b-versatile"  # Free tier model
+# Current Groq production model. The old "llama-3.1-70b-versatile" was
+# decommissioned by Groq (requests now fail with HTTP 400 model_decommissioned).
+# Override with the GROQ_MODEL env var to use a different model.
+# See https://console.groq.com/docs/models for the supported list.
+AI_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+AI_FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
 AI_MAX_TOKENS = 300
 AI_TEMPERATURE = 0.3
 
@@ -43,35 +48,78 @@ def ai_status():
     return "AI Assistant: READY (Groq free tier)"
 
 
-def _call_groq(prompt, system_prompt=None):
-    """Call Groq API with prompt"""
-    if GROQ_API_KEY == "your_groq_api_key" or not GROQ_API_KEY:
-        return None
-    
+# Tracks a model that Groq rejected this session so we stop retrying it.
+_DEAD_MODELS = set()
+
+
+def _post_groq(model, messages):
+    """Single Groq request for a given model. Returns (content, error_str).
+
+    On success: (text, None). On failure: (None, reason) — the reason string
+    contains the HTTP status and Groq error body so failures are visible instead
+    of being silently swallowed."""
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-    
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-    
     payload = {
-        "model": AI_MODEL,
+        "model": model,
         "messages": messages,
         "max_tokens": AI_MAX_TOKENS,
         "temperature": AI_TEMPERATURE
     }
-    
     try:
         response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
-        if response.status_code == 200:
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
     except Exception as e:
-        print(f"⚠️ Groq API error: {e}")
+        return None, f"request failed: {e}"
+
+    if response.status_code == 200:
+        try:
+            return response.json()["choices"][0]["message"]["content"], None
+        except (KeyError, IndexError, ValueError) as e:
+            return None, f"unexpected response shape: {e}"
+    return None, f"HTTP {response.status_code}: {response.text[:300]}"
+
+
+def _is_model_error(error_str):
+    """True if the Groq error indicates the model is invalid/decommissioned."""
+    if not error_str:
+        return False
+    low = error_str.lower()
+    return any(k in low for k in (
+        "decommission", "model_not_found", "does not exist",
+        "invalid model", "model `", "unknown model",
+    ))
+
+
+def _call_groq(prompt, system_prompt=None):
+    """Call Groq API with prompt, with automatic fallback to AI_FALLBACK_MODEL
+    if the primary model is rejected (e.g. decommissioned)."""
+    if GROQ_API_KEY == "your_groq_api_key" or not GROQ_API_KEY:
+        return None
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    # Try primary model, then fallback, skipping any model already known dead.
+    candidates = [m for m in (AI_MODEL, AI_FALLBACK_MODEL) if m and m not in _DEAD_MODELS]
+    if not candidates:
+        return None
+
+    for model in candidates:
+        content, error = _post_groq(model, messages)
+        if content is not None:
+            return content
+        if _is_model_error(error):
+            print(f"⚠️ Groq model '{model}' rejected ({error}); "
+                  f"set GROQ_MODEL to a supported model from https://console.groq.com/docs/models")
+            _DEAD_MODELS.add(model)
+            continue  # try the fallback model
+        # Non-model error (auth, rate limit, network) — don't burn the fallback.
+        print(f"⚠️ Groq API error ({model}): {error}")
+        break
     return None
 
 
