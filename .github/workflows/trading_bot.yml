@@ -164,11 +164,11 @@ jobs:
             echo "⚠️  upstox_token.txt is empty — nothing to sync."
             exit 0
           fi
-          echo "✅ Syncing token (len=${#TOKEN_VALUE}) → all 3 repos"
+          echo "✅ Syncing token (len=${#TOKEN_VALUE}) → Final group repos"
           gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/Final
           gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/Final-ORB-Only
-          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/upstox-bot
-          echo "✅ UPSTOX_TOKEN updated in all repositories."
+          # upstox-bot uses DIFFERENT API credentials — do NOT overwrite its token
+          echo "✅ UPSTOX_TOKEN synced: Final + Final-ORB-Only (upstox-bot excluded)"
 
       # ── 11. Save updated token for next run ───────────────────────────────
       - name: Save Upstox token (post-run)
