@@ -323,6 +323,8 @@ ORB_VOLUME_CONFIRMATION = 1.5  # Raised: 1.5x average volume required (was 1.2x)
 ORB_BREAKOUT_WINDOW_MINUTES = 30  # Tightened: only trade within 30 min of 9:20 (was 60)
 ORB_TARGET_MULTIPLIER = 2.0  # Target = 2x candle body
 ORB_STOP_MULTIPLIER = 1.0  # Stop at opposite end of candle
+ORB_ENABLE_RR_GATE = True   # Reject ORB signals whose risk:reward is too poor
+ORB_MIN_RISK_REWARD = 1.5   # Minimum reward:risk required before any ORB entry
 ORB_MIN_VOLUME = 500000  # Minimum average volume
 ORB_ENABLE_MARKET_ALIGNMENT = True  # Check Nifty direction
 ORB_ENABLE_FII_DII_FILTER = True  # Only trade with FII/DII alignment
@@ -341,8 +343,10 @@ ORB_REQUIRE_STRONG_FII_FOR_MEDIUM_RSI = True  # If RSI borderline, require STRON
 # Uses detect_topping_reversal (price at upper BB + doji/wick) AND
 # check_ha_reversal_alerts (HA colour flip + Klinger) as dual confirmation.
 ORB_ENABLE_REVERSAL_TRADE    = True    # Master toggle for contra-ORB trades
-ORB_REVERSAL_MIN_MOVE_PCT    = 0.4    # Price must have moved ≥0.4% against signal before reversal fires
+ORB_REVERSAL_MIN_MOVE_PCT    = 0.8    # Price must have moved ≥0.8% against signal before reversal fires (raised from 0.4 to avoid whipsaws)
 ORB_REVERSAL_CANDLES_MIN     = 2      # Wait at least 2 candles after ORB signal before checking reversal
+ORB_REVERSAL_COOLDOWN_MINUTES = 15    # Minimum minutes after the ORB signal before a reversal may fire (anti-whipsaw)
+ORB_REVERSAL_REQUIRE_OR_BREAK = True  # Require price to break the actual opening-range low/high, not just a % move
 ORB_REVERSAL_REQUIRE_HA      = True   # Require HA colour flip (via check_ha_reversal_alerts) for reversal
 ORB_REVERSAL_REQUIRE_TOPPING = True   # Require detect_topping_reversal confirmation for bearish→bullish flip
 ORB_REVERSAL_WINDOW_MINUTES  = 90     # Fire reversal up to 90 min after original ORB signal
@@ -3321,6 +3325,15 @@ def calculate_orb_levels(symbol, open_price, close_price, high_price, low_price,
     if risk <= 0:
         return None
 
+    # ── Risk:Reward gate ──────────────────────────────────────────────────────
+    # Reject setups that risk more than they aim to make (e.g. the TVSMOTOR
+    # 15-Jun ORB had R:R 0.98:1). Applies to every ORB entry regardless of
+    # confidence — R:R is a risk constraint, not a momentum filter.
+    if ORB_ENABLE_RR_GATE and (reward / risk) < ORB_MIN_RISK_REWARD:
+        if DEBUG_MODE:
+            print(f"⛔ ORB R:R gate: {symbol} R:R {reward / risk:.2f} < {ORB_MIN_RISK_REWARD}")
+        return None
+
     # Snapshot Klinger KO value for logging (already resolved above)
     klinger_info_snap = R3_LEVELS.get(ikey, {}).get('klinger') if ikey else None
     ko_snap = klinger_info_snap.get('klinger') if klinger_info_snap else None
@@ -3441,7 +3454,7 @@ def process_first_candles(access_token, live_data, late_pass=False):
             print(f"   ⏳ {len(ORB_LATE_CHECKED)} stocks had zero volume — will retry until breakout window closes")
         print(f"{'='*100}\n")
 
-def check_orb_breakout(symbol, current_price, current_volume, live_data):
+def check_orb_breakout(symbol, current_price, current_volume, live_data, access_token=''):
     if symbol not in ORB_SIGNALS or symbol in ORB_ALERTED_STOCKS:
         return None
     orb = ORB_SIGNALS[symbol]
@@ -3451,12 +3464,13 @@ def check_orb_breakout(symbol, current_price, current_volume, live_data):
     if minutes_since_920 < 0 or minutes_since_920 > ORB_BREAKOUT_WINDOW_MINUTES:
         return None
 
-    # ── Volume check: use VOLUME_DATA OR live_data avg_volume ───────────────
-    avg_volume = (VOLUME_DATA.get(symbol, {}).get('avg_volume')
-                  or VOLUME_DATA.get(symbol, {}).get('avg_vol_20d')
-                  or live_data.get('avg_volume', 0))
-    volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
-    if avg_volume > 0 and volume_ratio < ORB_VOLUME_CONFIRMATION:
+    # ── Volume check: intraday 5-min relative volume (RVOL) ─────────────────
+    ikey = orb.get('instrument_key') or SYMBOL_TO_ISIN.get(symbol, '')
+    rvol, _, _ = compute_intraday_rvol(symbol, access_token, ikey)
+    volume_ratio = rvol if rvol is not None else 0.0
+    if rvol is not None and rvol < ORB_VOLUME_CONFIRMATION:
+        if DEBUG_MODE:
+            print(f"⛔ ORB breakout: {symbol} RVOL {rvol:.2f}x < {ORB_VOLUME_CONFIRMATION}x")
         return None
 
     # ── Live RSI re-check at breakout moment ────────────────────────────────
@@ -3670,16 +3684,22 @@ def check_orb_reversal(symbol, ltp, volume, live_data, access_token, trader=None
     original_direction = orb.get('direction', '')   # 'BUY' or 'SELL'
     signal_time = orb.get('signal_time')
 
-    # ── Reversal window check ─────────────────────────────────────────────────
+    # ── Reversal window + cooldown checks ─────────────────────────────────────
     if signal_time is not None:
         elapsed = (now_ist() - signal_time).total_seconds() / 60
         if elapsed > ORB_REVERSAL_WINDOW_MINUTES:
             if DEBUG_MODE:
                 print(f"⛔ ORB reversal window expired for {symbol} ({elapsed:.0f}min > {ORB_REVERSAL_WINDOW_MINUTES}min)")
             return None
+        # Anti-whipsaw: do not flip the bias within minutes of the ORB signal.
+        if elapsed < ORB_REVERSAL_COOLDOWN_MINUTES:
+            if DEBUG_MODE:
+                print(f"⛔ ORB reversal cooldown for {symbol} ({elapsed:.0f}min < {ORB_REVERSAL_COOLDOWN_MINUTES}min)")
+            return None
 
     # ── Minimum adverse move check ────────────────────────────────────────────
     breakout_level = orb.get('breakout_level', ltp)
+    or_level = orb.get('stop_level')   # bullish ORB → OR low; bearish ORB → OR high
     if original_direction == 'SELL':
         # Original signal: bearish. Reversal = price going UP above breakout level.
         adverse_move_pct = (ltp - breakout_level) / breakout_level * 100
@@ -3695,6 +3715,19 @@ def check_orb_reversal(symbol, ltp, volume, live_data, access_token, trader=None
         if DEBUG_MODE:
             print(f"⛔ ORB reversal: {symbol} adverse move {adverse_move_pct:.2f}% < min {ORB_REVERSAL_MIN_MOVE_PCT}%")
         return None
+
+    # ── Require a real break of the opening range, not just a % wobble ─────────
+    # Bullish ORB → reversal only if price trades BELOW the OR low (stop_level).
+    # Bearish ORB → reversal only if price trades ABOVE the OR high (stop_level).
+    if ORB_REVERSAL_REQUIRE_OR_BREAK and or_level:
+        if reversal_direction == 'SELL' and ltp >= or_level:
+            if DEBUG_MODE:
+                print(f"⛔ ORB reversal: {symbol} ltp {ltp:.2f} has not broken OR low {or_level:.2f}")
+            return None
+        if reversal_direction == 'BUY' and ltp <= or_level:
+            if DEBUG_MODE:
+                print(f"⛔ ORB reversal: {symbol} ltp {ltp:.2f} has not broken OR high {or_level:.2f}")
+            return None
 
     # ── Resolve instrument key EARLY (needed for candle fetch + Klinger) ──────
     ikey = orb.get('instrument_key') or SYMBOL_TO_ISIN.get(symbol, '')
@@ -3791,15 +3824,12 @@ def check_orb_reversal(symbol, ltp, volume, live_data, access_token, trader=None
             print(f"⛔ ORB reversal: {symbol} HA colour flip not confirmed")
         return None
 
-    # ── Volume check ──────────────────────────────────────────────────────────
-    avg_volume = (VOLUME_DATA.get(symbol, {}).get('avg_volume')
-                  or VOLUME_DATA.get(symbol, {}).get('avg_vol_20d')
-                  or live_data.get('avg_volume', 0))
-    volume_ratio = volume / avg_volume if avg_volume > 0 else 0
-
-    if avg_volume > 0 and volume_ratio < ORB_VOLUME_CONFIRMATION:
+    # ── Volume check: intraday 5-min relative volume (RVOL) ─────────────────
+    rvol, _, _ = compute_intraday_rvol(symbol, access_token, ikey)
+    volume_ratio = rvol if rvol is not None else 0.0
+    if rvol is not None and rvol < ORB_VOLUME_CONFIRMATION:
         if DEBUG_MODE:
-            print(f"⛔ ORB reversal: {symbol} volume ratio {volume_ratio:.2f} < {ORB_VOLUME_CONFIRMATION}")
+            print(f"⛔ ORB reversal: {symbol} RVOL {rvol:.2f}x < {ORB_VOLUME_CONFIRMATION}x")
         return None
 
     # ── Build reversal signal ─────────────────────────────────────────────────
@@ -3993,7 +4023,7 @@ def monitor_orb_breakouts(live_data, access_token='', trader=None):
             volume = data.get('volume', 0)
             if ltp == 0:
                 continue
-            breakout = check_orb_breakout(symbol, ltp, volume, data)
+            breakout = check_orb_breakout(symbol, ltp, volume, data, access_token)
             if breakout:
                 send_orb_alert(breakout, trader)
                 continue   # already acting on continuation — skip reversal check
@@ -4878,6 +4908,40 @@ def get_realtime_5min_df(symbol, min_bars=20):
         df['volume'] = df['volume'].clip(lower=0)
 
         return df
+
+
+def compute_intraday_rvol(symbol, access_token='', instrument_key='', lookback=20):
+    """Relative volume (RVOL) of the latest completed 5-min candle vs the
+    trailing per-bar average.
+
+    Returns (rvol, latest_vol, avg_vol). ``rvol`` is None when there is not
+    enough candle history to judge (caller should then skip the volume gate
+    rather than block).
+
+    Why this exists: the old ORB volume gate compared the *cumulative* day
+    volume (live feed) against the 20-day *daily* average (VOLUME_DATA). Those
+    two quantities are never comparable intraday, so the ratio logged 0.00x and
+    the gate was silently disabled. RVOL compares like-for-like 5-min bars.
+    """
+    df = None
+    try:
+        df = get_realtime_5min_df(symbol, min_bars=6)
+    except Exception:
+        df = None
+    if (df is None or len(df) < 6) and access_token and instrument_key:
+        try:
+            df = fetch_5min_cached(access_token, instrument_key, bars=60, symbol=symbol)
+        except Exception:
+            df = None
+    if df is None or 'volume' not in df.columns or len(df) < 3:
+        return None, None, None
+    vols = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0)
+    latest = float(vols.iloc[-1])
+    base = vols.iloc[-(lookback + 1):-1]   # trailing bars, excluding the latest
+    avg = float(base.mean()) if len(base) else 0.0
+    if avg <= 0:
+        return None, latest, avg
+    return latest / avg, latest, avg
 
 
 def _fetch_5min_upstox_intraday(access_token, instrument_key, timeframe="5minute"):
