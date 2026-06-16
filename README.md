@@ -52,6 +52,12 @@ python orb_standalone.py
 - `orb_trades.csv` - Trade entries/exits
 - `orb_trading_log.txt` - Detailed text log
 
+## Troubleshooting
+
+- **Orders rejected with `403 UDAPI1154` / "static IP restrictions"** — the bot
+  produces signals but never fills any order. See [STATIC_IP_SETUP.md](STATIC_IP_SETUP.md)
+  for the cause (GitHub Actions runners have no static IP) and how to fix it.
+
 ## Disclaimer
 
 Use at your own risk. This is for educational purposes only.
