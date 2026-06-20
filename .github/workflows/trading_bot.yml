@@ -18,14 +18,155 @@ jobs:
   run-bot:
     name: Run Trading Bot
     runs-on: ubuntu-latest
-    timeout-minutes: 390          # 6.5 hours — covers full market session + buffer
+    timeout-minutes: 390
 
     steps:
-      # ── 1. Checkout code ──────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GH_PAT }}
 
-      # ... (rest of the file remains the same, but to save space I'm summarizing; in real I'd include full)
-      # Note: In practice, provide full content
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y xclip xdotool
+
+      - name: Install Google Chrome
+        run: |
+          sudo install -m 0755 -d /etc/apt/keyrings
+          wget -qO- https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg
+          sudo chmod a+r /etc/apt/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list > /dev/null
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Restore candle cache
+        uses: actions/cache@v4
+        with:
+          path: candle_cache/
+          key: candle-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            candle-cache-${{ runner.os }}-
+
+      - name: Restore Upstox token
+        uses: actions/cache@v4
+        with:
+          path: |
+            upstox_token.txt
+            upstox_refresh_token.txt
+            token_timestamp.json
+          key: upstox-token-${{ runner.os }}
+          restore-keys: |
+            upstox-token-${{ runner.os }}
+
+      - name: Validate Upstox token secret
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+        run: |
+          if [ -z "$UPSTOX_TOKEN" ]; then
+            echo "⚠️  WARNING: UPSTOX_TOKEN secret is empty."
+            echo "   The bot will fall back to Selenium OAuth login."
+          else
+            echo "✅ UPSTOX_TOKEN is set (length: ${#UPSTOX_TOKEN} chars)"
+          fi
+
+      - name: Run trading bot
+        env:
+          UPSTOX_EMAIL:      ${{ secrets.UPSTOX_EMAIL }}
+          UPSTOX_PASSWORD:   ${{ secrets.UPSTOX_PASSWORD }}
+          UPSTOX_MOBILE:     ${{ secrets.UPSTOX_MOBILE }}
+          UPSTOX_PASSCODE:   ${{ secrets.UPSTOX_PASSCODE }}
+          UPSTOX_API_KEY:    ${{ secrets.UPSTOX_API_KEY }}
+          UPSTOX_API_SECRET: ${{ secrets.UPSTOX_API_SECRET }}
+          UPSTOX_TOKEN:      ${{ secrets.UPSTOX_TOKEN }}
+          GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
+          GH_TOKEN:          ${{ secrets.GH_PAT }}
+          DISPLAY: ':99'
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 2
+          python - <<'PYEOF'
+          import traceback, sys, runpy
+          try:
+              runpy.run_path("Both4withcache10_headless.py", run_name="__main__")
+          except SystemExit as e:
+              sys.exit(e.code)
+          except Exception:
+              tb = traceback.format_exc()
+              print("❌ UNHANDLED EXCEPTION:\n" + tb, file=sys.stderr)
+              with open("crash_log.txt", "w") as f:
+                  f.write(tb)
+              sys.exit(1)
+          PYEOF
+
+      - name: Commit trading logs to repo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          for f in orb_signals.csv orb_trades.csv orb_trading_log.txt r3_live_alerts.csv r3_live_alerts.txt gap_trading_alerts.csv gap_trading_alerts.txt box_trading_alerts.csv box_trading_alerts.txt range_trading_alerts.csv range_trading_alerts.txt exits_log.csv exits_log.txt positions_tracking.csv fast_trades_entries.csv fast_trades_exits.csv fii_dii_cache.json fii_dii_trend_cache.json crash_log.txt; do
+            [ -f "$f" ] && git add -f "$f"
+          done
+          git add -f FII_DII_*.csv 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "ℹ️  No log files changed — skipping commit."
+          else
+            git commit -m "logs: trading session $(date +'%Y-%m-%d') [run ${{ github.run_id }}]"
+            git push
+            echo "✅ Logs committed and pushed."
+          fi
+
+      - name: Sync token to all repos
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "⚠️  GH_PAT not set — skipping cross-repo token sync."
+            exit 0
+          fi
+          TOKEN_VALUE=""
+          if [ -f upstox_token.txt ]; then
+            TOKEN_VALUE=$(cat upstox_token.txt | tr -d '[:space:]')
+          fi
+          if [ -z "$TOKEN_VALUE" ]; then
+            echo "⚠️  upstox_token.txt is empty — nothing to sync."
+            exit 0
+          fi
+          echo "✅ Syncing token"
+          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/Final
+          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/Final-ORB-Only
+          echo "✅ Synced"
+
+      - name: Save Upstox token (post-run)
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: |
+            upstox_token.txt
+            upstox_refresh_token.txt
+            token_timestamp.json
+          key: upstox-token-${{ runner.os }}
+
+      - name: Upload trading logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading-logs-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            *.csv
+            *.txt
+            crash_log.txt
+            FII_DII_*.csv
