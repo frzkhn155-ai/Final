@@ -1,0 +1,1 @@
+timestamp,symbol,signal,entry_price,stop_loss,target,entry_type,order_id,volume_ratio,candle_size_pct,bb_width,klinger_confirmed,klinger_status,confidence,premium_source,fii_trend_score,timeframe
