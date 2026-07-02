@@ -427,7 +427,53 @@ FII_REVERSAL_LONG_EMA_TREND         = 50
 FII_REVERSAL_LONG_STRATEGY_NAME     = "FII_REVERSAL_LONG"
 FII_REVERSAL_LONG_ALERTED_STOCKS    = set()   # fired today (long side)
 
-# ============ OPTION TRADING CONFIGURATION ============
+# ========== STRATEGY 1: BIG OPENING CANDLE + RESISTANCE REVERSAL ==========
+# Opening candle (first 15 min) spikes near 2-week resistance → next 15-min
+# red candle fails to break high → SHORT (PE). Mirror for LONG (CE).
+ENABLE_RESISTANCE_REVERSAL       = True
+RES_REVERSAL_LOOKBACK_DAYS       = 14       # "2-week" previous high/low
+RES_REVERSAL_BODY_MIN_PCT        = 1.5      # opening candle body must be ≥ 1.5%
+RES_REVERSAL_BAND_PCT            = 0.40     # "near resistance" tolerance band
+RES_REVERSAL_RSI_OVERBOUGHT      = 72       # skip if RSI > 72 (deep overbought, gap risk)
+RES_REVERSAL_VOLUME_MIN          = 1.5      # reversal candle must have ≥ 1.5× avg volume
+RES_REVERSAL_NOISE_MIN_BODY_PCT  = 0.30     # ignore tiny candles below this body size
+RES_REVERSAL_MAX_ORDERS          = 4
+RES_REVERSAL_ALERTED             = set()
+
+# ========== STRATEGY 2: DUAL-TF BOLLINGER BAND MIDDLE CROSS ==========
+# Price closes above/below middle BB on BOTH 5-min AND 1-hr simultaneously.
+# Extra filters: band squeeze before cross, volume spike, FII/DII alignment.
+ENABLE_DUAL_TF_BB               = True
+DUAL_TF_BB_PERIOD               = 20       # BB period (same as main BOLLINGER_PERIOD)
+DUAL_TF_BB_SQUEEZE_LOOKBACK     = 10       # bars to check for squeeze prior to cross
+DUAL_TF_BB_VOLUME_MIN           = 1.6      # volume spike on cross candle
+DUAL_TF_BB_NOISE_MIN_BODY_PCT   = 0.25     # ignore tiny doji-like candles
+DUAL_TF_BB_MAX_ORDERS           = 4
+DUAL_TF_BB_ALERTED              = set()
+
+# ========== STRATEGY 3: FII/DII MULTI-CONFLUENCE BREAKOUT ==========
+# Three sub-modes share the same scan function, controlled per call:
+#   Mode A — General universe: first 1H high (with wick) + next TF break +
+#             last-1-week weekly high (without wick) + volume spike
+#   Mode B — FII/DII universe: same as A but 2-week lookback + 1H BB-middle
+#             cross + next 1H candle must break previous high (2-candle confirm)
+#   Both require: previous candle AND new candle both close above/below level,
+#                 sudden volume (≥ 2× avg), and FII/DII alignment for mode B.
+ENABLE_FIIDII_BREAKOUT          = True
+FIIDII_BRK_LOOKBACK_DAYS_GEN    = 7        # Mode A: 1-week weekly high lookback
+FIIDII_BRK_LOOKBACK_DAYS_FII    = 14       # Mode B: 2-week lookback
+FIIDII_BRK_VOLUME_MIN           = 1.8      # volume spike threshold
+FIIDII_BRK_NOISE_MIN_BODY_PCT   = 0.35     # ignore small reversal candles
+FIIDII_BRK_2CANDLE_CONFIRM      = True     # require TWO consecutive closes above level
+FIIDII_BRK_MAX_ORDERS           = 5
+FIIDII_BRK_ALERTED              = set()    # (symbol, mode) tuples fired today
+
+# CSV log files for new strategies
+RES_REVERSAL_CSV      = "resistance_reversal_alerts.csv"
+DUAL_TF_BB_CSV        = "dual_tf_bb_alerts.csv"
+FIIDII_BREAKOUT_CSV   = "fiidii_breakout_alerts.csv"
+
+
 OPTION_PREMIUM_MIN_THRESHOLD = 1.0  # Minimum premium to consider
 OPTION_PREMIUM_MAX_THRESHOLD = 500.0  # Maximum premium to consider
 OPTION_LTP_RETRY_ATTEMPTS = 5  # Number of retries for LTP fetch
@@ -3990,6 +4036,9 @@ def check_orb_time_and_process(access_token, live_data):
         global MIDDAY_BOX_ORDER_COUNT, AFTERNOON_ORDER_COUNT
         MIDDAY_BOX_ORDER_COUNT = 0
         AFTERNOON_ORDER_COUNT  = 0
+        RES_REVERSAL_ALERTED.clear()
+        DUAL_TF_BB_ALERTED.clear()
+        FIIDII_BRK_ALERTED.clear()
 
     # ── PRIMARY PASS ─────────────────────────────────────────────────────────
     # Old: only ran 09:20-09:25. Bot starting at 09:26 silently skipped ORB.
@@ -10506,6 +10555,597 @@ def send_midday_box_alert(signal, trader=None):
             print(f"⚠️ Midday box order error for {s}: {e}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  THREE NEW REVERSAL STRATEGIES
+#  S1. Resistance Reversal    — opening spike to 2-wk high → red rejection
+#  S2. Dual-TF BB Middle Cross — 5-min AND 1-hr cross simultaneously
+#  S3. FII/DII Multi-Confluence Breakout — weekly high + 2-candle confirm + vol
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_historical_high_low(access_token, ikey, symbol, lookback_days=14):
+    """Return (highest_high, lowest_low) over last `lookback_days` DAILY candles.
+
+    Uses the cached 5-min bars resampled to daily as a fallback if a dedicated
+    daily endpoint isn't available.  Returns (None, None) on failure.
+    """
+    try:
+        df5 = fetch_5min_cached(access_token, ikey, bars=lookback_days * 78 + 80,
+                                symbol=symbol)
+        if df5 is None or len(df5) < 20:
+            return None, None
+        import pandas as pd
+        df = df5.copy()
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.set_index('timestamp')
+        daily = df[['high', 'low', 'close', 'volume']].resample('D').agg(
+            {'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+        ).dropna()
+        # Exclude today — we want the PREVIOUS resistance, not today's live action
+        today = now_ist().date()
+        daily = daily[daily.index.date < today]
+        if len(daily) < 2:
+            return None, None
+        window = daily.tail(lookback_days)
+        return float(window['high'].max()), float(window['low'].min())
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⛔ _get_historical_high_low {symbol}: {e}")
+        return None, None
+
+
+def _get_weekly_high_low_body(access_token, ikey, symbol, lookback_days=14):
+    """Return (weekly_high_body, weekly_low_body) using candle CLOSE prices
+    (no wick) over the lookback window.  This is the 'weekly high without wick'
+    level that serves as the key resistance/support for the breakout strategy.
+    """
+    try:
+        df5 = fetch_5min_cached(access_token, ikey, bars=lookback_days * 78 + 80,
+                                symbol=symbol)
+        if df5 is None or len(df5) < 20:
+            return None, None
+        import pandas as pd
+        df = df5.copy()
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.set_index('timestamp')
+        weekly = df[['open', 'high', 'low', 'close']].resample('W').agg(
+            {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}
+        ).dropna()
+        today = now_ist().date()
+        # Exclude the current (incomplete) week
+        weekly = weekly[weekly.index.date < today]
+        if len(weekly) < 1:
+            return None, None
+        window = weekly.tail(max(1, lookback_days // 7))
+        # "Without wick" = body high = max(open, close) per week
+        body_highs = window[['open', 'close']].max(axis=1)
+        body_lows  = window[['open', 'close']].min(axis=1)
+        return float(body_highs.max()), float(body_lows.min())
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⛔ _get_weekly_high_low_body {symbol}: {e}")
+        return None, None
+
+
+def _candle_body_pct(candle) -> float:
+    """Return candle body size as % of open price.  Safe against zero open."""
+    o = candle.get('open', 0) if isinstance(candle, dict) else getattr(candle, 'open', 0)
+    c = candle.get('close', 0) if isinstance(candle, dict) else getattr(candle, 'close', 0)
+    if not o:
+        return 0.0
+    return abs(c - o) / o * 100
+
+
+# ── Strategy 1: Big Opening Candle + Resistance Reversal ──────────────────────
+
+def detect_resistance_reversal(access_token, live_data):
+    """Opening-candle spike to 2-week resistance → 15-min red rejection → PE.
+    Mirror for support → CE (LONG).
+
+    Entry gates (SHORT/PE):
+      1. Opening 15-min candle body ≥ RES_REVERSAL_BODY_MIN_PCT (big spike up)
+      2. High of opening candle within RES_REVERSAL_BAND_PCT % of 2-week high
+      3. Next completed 15-min candle: red body + high < opening candle high (failure)
+      4. Volume on rejection candle ≥ RES_REVERSAL_VOLUME_MIN × 20-bar avg
+      5. RSI ≤ RES_REVERSAL_RSI_OVERBOUGHT (not already deeply extended)
+      6. Noise gate: rejection candle body ≥ RES_REVERSAL_NOISE_MIN_BODY_PCT
+
+    Mirror conditions for LONG/CE (spike down to 2-week support → green rejection).
+    """
+    global RES_REVERSAL_ALERTED
+    if not ENABLE_RESISTANCE_REVERSAL:
+        return []
+
+    signals = []
+
+    for ikey, live in live_data.items():
+        symbol = ISIN_TO_SYMBOL.get(ikey, ikey)
+        if symbol in RES_REVERSAL_ALERTED:
+            continue
+        if ikey not in R3_LEVELS:
+            continue
+
+        try:
+            ltp = live.get('ltp', 0)
+            if not ltp:
+                continue
+
+            df5 = fetch_5min_cached(access_token, ikey, bars=120, symbol=symbol)
+            if df5 is None or len(df5) < 25:
+                continue
+
+            # Resample to 15-min
+            import pandas as pd
+            df = df5.copy()
+            if 'timestamp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df = df.set_index('timestamp')
+            df15 = df[['open', 'high', 'low', 'close', 'volume']].resample('15min').agg(
+                {'open': 'first', 'high': 'max', 'low': 'min',
+                 'close': 'last', 'volume': 'sum'}
+            ).dropna().reset_index()
+            if len(df15) < 4:
+                continue
+
+            open_c  = df15.iloc[-3]   # opening 15-min candle (3rd from end = 2 complete + current)
+            next_c  = df15.iloc[-2]   # next completed 15-min candle
+            # (df15.iloc[-1] is the still-building current candle — ignore)
+
+            open_body  = abs(open_c['close'] - open_c['open'])
+            open_body_pct = open_body / open_c['open'] * 100 if open_c['open'] else 0
+
+            # ── Noise gate: opening candle must be a BIG candle ──────────────
+            if open_body_pct < RES_REVERSAL_BODY_MIN_PCT:
+                continue
+
+            info      = R3_LEVELS[ikey]
+            avg_vol   = df5['volume'].tail(20).mean() or 1
+            vol_ratio = next_c['volume'] / avg_vol
+
+            res_high, sup_low = _get_historical_high_low(
+                access_token, ikey, symbol,
+                lookback_days=RES_REVERSAL_LOOKBACK_DAYS
+            )
+            if res_high is None:
+                continue
+
+            rsi = calculate_rsi(df5.tail(20))
+
+            # ── SHORT setup ──────────────────────────────────────────────────
+            near_res  = res_high * (1 - RES_REVERSAL_BAND_PCT / 100)
+            next_red  = next_c['close'] < next_c['open']
+            no_break  = next_c['high'] < open_c['high']
+            noise_ok  = abs(next_c['close'] - next_c['open']) / next_c['open'] * 100 >= RES_REVERSAL_NOISE_MIN_BODY_PCT if next_c['open'] else False
+            open_near_res = open_c['high'] >= near_res
+            rsi_ok    = rsi is None or rsi <= RES_REVERSAL_RSI_OVERBOUGHT
+
+            if open_near_res and next_red and no_break and noise_ok and rsi_ok \
+               and vol_ratio >= RES_REVERSAL_VOLUME_MIN:
+                stop   = open_c['high'] * 1.003
+                risk   = stop - ltp
+                target = ltp - 2.0 * risk if risk > 0 else ltp * 0.985
+                RES_REVERSAL_ALERTED.add(symbol)
+                signals.append({
+                    'symbol': symbol, 'ikey': ikey,
+                    'signal': 'RES_REVERSAL_SHORT', 'direction': 'PE',
+                    'entry': ltp, 'stop': stop, 'target': target,
+                    'resistance': res_high, 'open_high': open_c['high'],
+                    'open_body_pct': round(open_body_pct, 2),
+                    'vol_ratio': round(vol_ratio, 2), 'rsi': rsi,
+                    'timestamp': now_ist(),
+                })
+                if DEBUG_MODE:
+                    print(f"🔴 RES_REVERSAL_SHORT: {symbol} | near ₹{res_high:.2f} | vol {vol_ratio:.2f}x")
+                continue
+
+            # ── LONG setup (mirror) ──────────────────────────────────────────
+            if sup_low is None:
+                continue
+            near_sup  = sup_low * (1 + RES_REVERSAL_BAND_PCT / 100)
+            next_green = next_c['close'] > next_c['open']
+            no_break_dn = next_c['low'] > open_c['low']
+            noise_ok_l  = abs(next_c['close'] - next_c['open']) / next_c['open'] * 100 >= RES_REVERSAL_NOISE_MIN_BODY_PCT if next_c['open'] else False
+            open_near_sup = open_c['low'] <= near_sup
+            rsi_ok_l  = rsi is None or rsi >= (100 - RES_REVERSAL_RSI_OVERBOUGHT)
+
+            if open_near_sup and next_green and no_break_dn and noise_ok_l and rsi_ok_l \
+               and vol_ratio >= RES_REVERSAL_VOLUME_MIN:
+                stop   = open_c['low'] * 0.997
+                risk   = ltp - stop
+                target = ltp + 2.0 * risk if risk > 0 else ltp * 1.015
+                RES_REVERSAL_ALERTED.add(symbol)
+                signals.append({
+                    'symbol': symbol, 'ikey': ikey,
+                    'signal': 'RES_REVERSAL_LONG', 'direction': 'CE',
+                    'entry': ltp, 'stop': stop, 'target': target,
+                    'support': sup_low, 'open_low': open_c['low'],
+                    'open_body_pct': round(open_body_pct, 2),
+                    'vol_ratio': round(vol_ratio, 2), 'rsi': rsi,
+                    'timestamp': now_ist(),
+                })
+                if DEBUG_MODE:
+                    print(f"🟢 RES_REVERSAL_LONG: {symbol} | near ₹{sup_low:.2f} | vol {vol_ratio:.2f}x")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ detect_resistance_reversal [{symbol}]: {e}")
+
+    return signals
+
+
+# ── Strategy 2: Dual-TF Bollinger Band Middle Cross ───────────────────────────
+
+def detect_dual_tf_bb_cross(access_token, live_data):
+    """Close above/below BB middle on BOTH 5-min AND 1-hr simultaneously → CE/PE.
+
+    Entry gates:
+      1. 5-min: last COMPLETED candle crosses BB(20) middle from below (CE) / above (PE)
+         i.e. prev_close was below/above middle, last_close is above/below
+      2. 1-hr: same cross confirmed on the last completed 1-hr bar
+      3. Volume spike on 5-min cross candle ≥ DUAL_TF_BB_VOLUME_MIN × 20-bar avg
+      4. Band squeeze detected in the preceding DUAL_TF_BB_SQUEEZE_LOOKBACK bars
+         on the 5-min (tight bands = coiled energy → higher probability on break)
+      5. FII/DII alignment preferred (not mandatory — signal printed regardless,
+         but confidence label reflects alignment)
+      6. Noise gate: crossing candle body ≥ DUAL_TF_BB_NOISE_MIN_BODY_PCT
+    """
+    global DUAL_TF_BB_ALERTED
+    if not ENABLE_DUAL_TF_BB:
+        return []
+
+    signals = []
+
+    for ikey, live in live_data.items():
+        symbol = ISIN_TO_SYMBOL.get(ikey, ikey)
+        if symbol in DUAL_TF_BB_ALERTED:
+            continue
+        if ikey not in R3_LEVELS:
+            continue
+
+        try:
+            ltp = live.get('ltp', 0)
+            if not ltp:
+                continue
+
+            df5 = fetch_5min_cached(access_token, ikey, bars=120, symbol=symbol)
+            if df5 is None or len(df5) < DUAL_TF_BB_PERIOD + 5:
+                continue
+
+            # ── 5-min BB ────────────────────────────────────────────────────
+            up5, mid5, lo5, width5, _ = calculate_bollinger_bands(
+                df5, period=DUAL_TF_BB_PERIOD)
+            if mid5 is None:
+                continue
+
+            prev5  = df5.iloc[-3]   # last completed candle - 1
+            last5  = df5.iloc[-2]   # last completed candle
+
+            cross_up5   = prev5['close'] < mid5.iloc[-3] and last5['close'] > mid5.iloc[-2]
+            cross_down5 = prev5['close'] > mid5.iloc[-3] and last5['close'] < mid5.iloc[-2]
+            if not cross_up5 and not cross_down5:
+                continue
+
+            # Noise gate
+            body5_pct = abs(last5['close'] - last5['open']) / last5['open'] * 100 if last5['open'] else 0
+            if body5_pct < DUAL_TF_BB_NOISE_MIN_BODY_PCT:
+                if DEBUG_MODE:
+                    print(f"⛔ dual_tf_bb {symbol}: 5-min body too small ({body5_pct:.2f}%)")
+                continue
+
+            # Volume
+            avg_vol5   = df5['volume'].tail(20).mean() or 1
+            vol_ratio5 = last5['volume'] / avg_vol5
+            if vol_ratio5 < DUAL_TF_BB_VOLUME_MIN:
+                if DEBUG_MODE:
+                    print(f"⛔ dual_tf_bb {symbol}: vol {vol_ratio5:.2f}x < {DUAL_TF_BB_VOLUME_MIN}")
+                continue
+
+            # Squeeze check
+            squeeze = detect_bollinger_squeeze(
+                width5, threshold=0.15,
+                lookback=DUAL_TF_BB_SQUEEZE_LOOKBACK
+            )
+
+            # ── 1-hr BB (resample) ───────────────────────────────────────────
+            df1h = resample_to_1h(df5)
+            if df1h is None or len(df1h) < DUAL_TF_BB_PERIOD + 2:
+                if DEBUG_MODE:
+                    print(f"⛔ dual_tf_bb {symbol}: insufficient 1H bars")
+                continue
+
+            up1h, mid1h, lo1h, _, _ = calculate_bollinger_bands(
+                df1h, period=DUAL_TF_BB_PERIOD)
+            if mid1h is None:
+                continue
+
+            prev1h = df1h.iloc[-3]
+            last1h = df1h.iloc[-2]
+
+            cross_up1h   = prev1h['close'] < mid1h.iloc[-3] and last1h['close'] > mid1h.iloc[-2]
+            cross_down1h = prev1h['close'] > mid1h.iloc[-3] and last1h['close'] < mid1h.iloc[-2]
+
+            # Both TFs must agree
+            if cross_up5 and not cross_up1h:
+                if DEBUG_MODE:
+                    print(f"⛔ dual_tf_bb {symbol}: 5m BULL cross but 1H not confirmed")
+                continue
+            if cross_down5 and not cross_down1h:
+                if DEBUG_MODE:
+                    print(f"⛔ dual_tf_bb {symbol}: 5m BEAR cross but 1H not confirmed")
+                continue
+
+            # FII/DII alignment (confidence tier)
+            fii_sig    = get_fii_dii_signal(symbol)
+            direction  = 'CE' if cross_up5 else 'PE'
+            fii_aligned = (direction == 'CE' and fii_sig in ('STRONG_BUY', 'BUY')) or \
+                          (direction == 'PE' and fii_sig in ('STRONG_SELL', 'SELL'))
+            confidence = ('VERY_HIGH' if fii_aligned and squeeze else
+                          'HIGH'      if fii_aligned or squeeze else
+                          'MEDIUM')
+
+            # Build signal
+            if direction == 'CE':
+                stop   = float(lo5.iloc[-2]) * 0.997
+                risk   = ltp - stop
+                target = ltp + 2.0 * risk if risk > 0 else ltp * 1.015
+            else:
+                stop   = float(up5.iloc[-2]) * 1.003
+                risk   = stop - ltp
+                target = ltp - 2.0 * risk if risk > 0 else ltp * 0.985
+
+            DUAL_TF_BB_ALERTED.add(symbol)
+            signals.append({
+                'symbol': symbol, 'ikey': ikey,
+                'signal': f'DUAL_TF_BB_{"BULL" if cross_up5 else "BEAR"}',
+                'direction': direction,
+                'entry': ltp, 'stop': stop, 'target': target,
+                'mid5': float(mid5.iloc[-2]), 'mid1h': float(mid1h.iloc[-2]),
+                'vol_ratio': round(vol_ratio5, 2),
+                'squeeze': squeeze, 'fii_dii': fii_sig,
+                'confidence': confidence, 'timestamp': now_ist(),
+            })
+            icon = '🟢' if direction == 'CE' else '🔴'
+            if DEBUG_MODE:
+                print(f"{icon} DUAL_TF_BB {direction}: {symbol} | "
+                      f"vol {vol_ratio5:.2f}x | squeeze={squeeze} | FII={fii_sig}")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ detect_dual_tf_bb_cross [{symbol}]: {e}")
+
+    return signals
+
+
+# ── Strategy 3: FII/DII Multi-Confluence Breakout ─────────────────────────────
+
+def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
+    """Multi-confluence breakout for FII/DII stocks (and general pool).
+
+    Mode 'general' (Mode A — all F&O symbols):
+      • First 1-hr candle high WITH wick as resistance
+      • Next 5-min or 15-min candle breaks and CLOSES above it
+      • Last 1-week weekly high WITHOUT wick (body close) also broken
+      • 2-candle confirmation: PREVIOUS close + NEW close both above level
+      • Volume spike ≥ FIIDII_BRK_VOLUME_MIN × 20-bar average
+      Mirror for SHORT: first 1H low, weekly low, 2 closes below.
+
+    Mode 'fii' (Mode B — FII/DII watchlist, 2-week lookback):
+      All of Mode A PLUS:
+      • 1-hr candle crosses BB(20) middle (price moving into trend)
+      • FII/DII must be net BUYING (for CE) or net SELLING (for PE)
+      • Lookback extended to 14 days
+      • Noise gate: candle body ≥ FIIDII_BRK_NOISE_MIN_BODY_PCT
+
+    'If price reverses with small candles or small price changes → ignore
+    and continue waiting.' — implemented via the noise gate and 2-candle confirm.
+    """
+    global FIIDII_BRK_ALERTED
+    if not ENABLE_FIIDII_BREAKOUT:
+        return []
+
+    lookback  = FIIDII_BRK_LOOKBACK_DAYS_FII if mode == 'fii' else FIIDII_BRK_LOOKBACK_DAYS_GEN
+    pool_keys = list(R3_LEVELS.keys())
+    if mode == 'fii':
+        fii_symbols = FII_DII_STRONG_BUY | FII_DII_STRONG_SELL
+        pool_keys   = [k for k in pool_keys
+                       if R3_LEVELS[k].get('symbol') in fii_symbols]
+
+    signals = []
+
+    for ikey in pool_keys:
+        info   = R3_LEVELS.get(ikey, {})
+        symbol = info.get('symbol', ikey)
+        tag    = (symbol, mode)
+        if tag in FIIDII_BRK_ALERTED:
+            continue
+
+        live   = live_data.get(ikey, {})
+        ltp    = live.get('ltp', 0)
+        if not ltp:
+            continue
+
+        try:
+            df5 = fetch_5min_cached(access_token, ikey, bars=lookback * 78 + 80,
+                                    symbol=symbol)
+            if df5 is None or len(df5) < 30:
+                continue
+
+            import pandas as pd
+
+            # ── First 1-hr candle high (with wick) ──────────────────────────
+            df = df5.copy()
+            if 'timestamp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df = df.set_index('timestamp')
+            df1h = df[['open', 'high', 'low', 'close', 'volume']].resample('1h').agg(
+                {'open': 'first', 'high': 'max', 'low': 'min',
+                 'close': 'last', 'volume': 'sum'}
+            ).dropna().reset_index()
+            if len(df1h) < 3:
+                continue
+
+            first_1h_high = float(df1h.iloc[0]['high'])   # today's first 1-hr bar
+            first_1h_low  = float(df1h.iloc[0]['low'])
+            last_1h       = df1h.iloc[-2]   # last completed 1-hr bar
+
+            # ── Weekly high/low WITHOUT wick (body only) ─────────────────────
+            weekly_res, weekly_sup = _get_weekly_high_low_body(
+                access_token, ikey, symbol, lookback_days=lookback)
+            if weekly_res is None:
+                continue
+
+            # ── 5-min 2-candle confirmation ──────────────────────────────────
+            prev5 = df5.iloc[-3]   # second-to-last completed 5-min bar
+            last5 = df5.iloc[-2]   # last completed 5-min bar
+
+            avg_vol   = df5['volume'].tail(20).mean() or 1
+            vol_ratio = last5['volume'] / avg_vol
+
+            # Noise gate: ignore tiny candles
+            body5 = abs(last5['close'] - last5['open']) / last5['open'] * 100 if last5['open'] else 0
+            if body5 < FIIDII_BRK_NOISE_MIN_BODY_PCT:
+                if DEBUG_MODE:
+                    print(f"⛔ fiidii_brk {symbol}({mode}): candle body too small {body5:.2f}%")
+                continue
+
+            # Volume
+            if vol_ratio < FIIDII_BRK_VOLUME_MIN:
+                if DEBUG_MODE:
+                    print(f"⛔ fiidii_brk {symbol}({mode}): vol {vol_ratio:.2f}x < {FIIDII_BRK_VOLUME_MIN}")
+                continue
+
+            fii_sig = get_fii_dii_signal(symbol)
+
+            # ── Mode B: BB middle cross on 1H ────────────────────────────────
+            bb_ok_bull = True
+            bb_ok_bear = True
+            if mode == 'fii':
+                _, mid1h_s, _, _, _ = calculate_bollinger_bands(df1h, period=20)
+                if mid1h_s is not None and len(df1h) >= 22:
+                    prev_1h = df1h.iloc[-3]
+                    last_1h_row = df1h.iloc[-2]
+                    bb_ok_bull = (prev_1h['close'] < float(mid1h_s.iloc[-3]) and
+                                  last_1h_row['close'] > float(mid1h_s.iloc[-2]))
+                    bb_ok_bear = (prev_1h['close'] > float(mid1h_s.iloc[-3]) and
+                                  last_1h_row['close'] < float(mid1h_s.iloc[-2]))
+
+            # ── LONG (CE): break above first-1H-high AND weekly-body-high ────
+            # "Previous candle AND new candle break" = 2-candle close confirmation
+            long_level = max(first_1h_high, weekly_res)
+            two_close_bull = (prev5['close'] > long_level and
+                              last5['close'] > long_level)
+            fii_bull_ok = mode != 'fii' or fii_sig in ('STRONG_BUY', 'BUY')
+
+            if two_close_bull and bb_ok_bull and fii_bull_ok:
+                stop   = first_1h_low * 0.997
+                risk   = ltp - stop
+                target = ltp + 2.5 * risk if risk > 0 else ltp * 1.02
+                confidence = ('VERY_HIGH' if fii_sig in ('STRONG_BUY',) else 'HIGH')
+                FIIDII_BRK_ALERTED.add(tag)
+                signals.append({
+                    'symbol': symbol, 'ikey': ikey, 'mode': mode,
+                    'signal': f'FIIDII_BRK_LONG_{mode.upper()}',
+                    'direction': 'CE',
+                    'entry': ltp, 'stop': stop, 'target': target,
+                    'level': long_level,
+                    'first_1h_high': first_1h_high, 'weekly_res': weekly_res,
+                    'vol_ratio': round(vol_ratio, 2),
+                    'fii_dii': fii_sig, 'confidence': confidence,
+                    'timestamp': now_ist(),
+                })
+                if DEBUG_MODE:
+                    print(f"🟢 FIIDII_BRK CE [{mode}]: {symbol} | level ₹{long_level:.2f} | vol {vol_ratio:.2f}x")
+                continue
+
+            # ── SHORT (PE): break below first-1H-low AND weekly-body-low ─────
+            short_level = min(first_1h_low, weekly_sup)
+            two_close_bear = (prev5['close'] < short_level and
+                              last5['close'] < short_level)
+            fii_bear_ok = mode != 'fii' or fii_sig in ('STRONG_SELL', 'SELL')
+
+            if two_close_bear and bb_ok_bear and fii_bear_ok:
+                stop   = first_1h_high * 1.003
+                risk   = stop - ltp
+                target = ltp - 2.5 * risk if risk > 0 else ltp * 0.98
+                confidence = ('VERY_HIGH' if fii_sig in ('STRONG_SELL',) else 'HIGH')
+                FIIDII_BRK_ALERTED.add(tag)
+                signals.append({
+                    'symbol': symbol, 'ikey': ikey, 'mode': mode,
+                    'signal': f'FIIDII_BRK_SHORT_{mode.upper()}',
+                    'direction': 'PE',
+                    'entry': ltp, 'stop': stop, 'target': target,
+                    'level': short_level,
+                    'first_1h_low': first_1h_low, 'weekly_sup': weekly_sup,
+                    'vol_ratio': round(vol_ratio, 2),
+                    'fii_dii': fii_sig, 'confidence': confidence,
+                    'timestamp': now_ist(),
+                })
+                if DEBUG_MODE:
+                    print(f"🔴 FIIDII_BRK PE [{mode}]: {symbol} | level ₹{short_level:.2f} | vol {vol_ratio:.2f}x")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ detect_fiidii_confluence_breakout [{symbol}][{mode}]: {e}")
+
+    return signals
+
+
+def _log_and_place_new_reversal(signal, trader, csv_file, strategy_name):
+    """Unified logger + order placer for all three new reversal strategies."""
+    s   = signal['symbol']
+    d   = signal['direction']
+    ep  = signal['entry']
+    sl  = signal['stop']
+    tgt = signal['target']
+    rr  = abs(tgt - ep) / abs(ep - sl) if abs(ep - sl) > 0 else 0
+
+    icon = '🟢' if d == 'CE' else '🔴'
+    print(f"\n{'='*80}")
+    print(f"{icon} {strategy_name}: {signal['signal']}")
+    print(f"{'='*80}")
+    print(f"Stock: {s} | Direction: {d} | Time: {now_ist().strftime('%H:%M:%S')}")
+    print(f"Entry: ₹{ep:.2f} | Stop: ₹{sl:.2f} | Target: ₹{tgt:.2f} | R:R {rr:.1f}x")
+    extras = {k: v for k, v in signal.items()
+              if k not in ('symbol','ikey','signal','direction','entry',
+                           'stop','target','timestamp','mode')}
+    for k, v in extras.items():
+        if isinstance(v, float):
+            print(f"  {k}: ₹{v:.2f}" if 'price' in k.lower() or 'level' in k.lower() or 'res' in k.lower() or 'sup' in k.lower() else f"  {k}: {v:.2f}")
+        else:
+            print(f"  {k}: {v}")
+    print(f"{'='*80}")
+
+    # CSV log
+    try:
+        import csv as _csv
+        fe = os.path.exists(csv_file)
+        with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+            w = _csv.writer(f)
+            if not fe:
+                w.writerow(['Timestamp', 'Symbol', 'Signal', 'Direction',
+                            'Entry', 'Stop', 'Target', 'RR',
+                            'VolRatio', 'Confidence', 'FII_DII'])
+            w.writerow([
+                now_ist().strftime('%Y-%m-%d %H:%M:%S'),
+                s, signal['signal'], d,
+                f'{ep:.2f}', f'{sl:.2f}', f'{tgt:.2f}', f'{rr:.2f}',
+                signal.get('vol_ratio', ''),
+                signal.get('confidence', ''),
+                signal.get('fii_dii', ''),
+            ])
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⚠️ CSV log error ({csv_file}): {e}")
+
+    # Place order
+    if trader and is_order_time_allowed():
+        try:
+            place_breakout_order(signal, trader)
+        except Exception as e:
+            print(f"⚠️ Order error for {s}: {e}")
+
+
 def monitor_session_phase(live_data, access_token, trader=None):
     """Dispatcher: routes to the correct strategy based on current session phase.
 
@@ -10913,6 +11553,35 @@ def enhanced_monitor(access_token, keys, symbols):
                             print(f"{'='*80}")
                             if trader:
                                 place_breakout_order(sig, trader)
+
+                    # ── New Reversal Strategies (throttled: every 2 scans) ────
+                    if scan_count % 2 == 0:
+
+                        # S1: Big opening candle + resistance reversal
+                        if ENABLE_RESISTANCE_REVERSAL:
+                            res_sigs = detect_resistance_reversal(access_token, live_data)
+                            for sig in res_sigs:
+                                _log_and_place_new_reversal(sig, trader, RES_REVERSAL_CSV, "RESISTANCE REVERSAL")
+
+                        # S2: Dual-TF BB middle cross (5-min + 1-hr)
+                        if ENABLE_DUAL_TF_BB:
+                            bb_sigs = detect_dual_tf_bb_cross(access_token, live_data)
+                            for sig in bb_sigs:
+                                _log_and_place_new_reversal(sig, trader, DUAL_TF_BB_CSV, "DUAL-TF BB")
+
+                        # S3a: General universe — first-1H + weekly high/low breakout
+                        if ENABLE_FIIDII_BREAKOUT:
+                            gen_sigs = detect_fiidii_confluence_breakout(
+                                access_token, live_data, mode='general')
+                            for sig in gen_sigs:
+                                _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "CONFLUENCE BREAKOUT")
+
+                        # S3b: FII/DII universe — same + 2-wk lookback + BB middle + 2-candle confirm
+                        if ENABLE_FIIDII_BREAKOUT:
+                            fii_sigs = detect_fiidii_confluence_breakout(
+                                access_token, live_data, mode='fii')
+                            for sig in fii_sigs:
+                                _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "FII/DII CONFLUENCE")
 
                     for key, live in live_data.items():
                         if key in R3_LEVELS:
