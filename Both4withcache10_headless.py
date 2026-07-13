@@ -473,6 +473,25 @@ RES_REVERSAL_CSV      = "resistance_reversal_alerts.csv"
 DUAL_TF_BB_CSV        = "dual_tf_bb_alerts.csv"
 FIIDII_BREAKOUT_CSV   = "fiidii_breakout_alerts.csv"
 
+# ========== STRATEGY 4: FII/DII BB-MID CROSS + LIVE CONTINUATION ==========
+# Monitors FII/DII watchlist continuously (persists across days, not reset
+# daily). When a completed 1H candle crosses the BB(20) middle, "arm" that
+# candle's high/low. On EVERY scan afterwards (no waiting for next candle to
+# close), check live LTP against the armed level with a small buffer.
+#   Armed CE: live LTP > armed_high * (1 + buffer%) → ENTRY CE immediately
+#   Armed PE: live LTP < armed_low  * (1 - buffer%) → ENTRY PE immediately
+# Un-arm automatically after ENABLE_FII_BB_ARM_MAX_HOURS with no break.
+ENABLE_FII_BB_CONTINUATION   = True
+FII_BB_ARM_BUFFER_PCT        = 0.12     # live-break buffer above/below armed level
+FII_BB_ARM_MAX_HOURS         = 2        # un-arm if no break within this many hours
+FII_BB_NOISE_MIN_BODY_PCT    = 0.25     # ignore tiny BB-cross candles (indecisive)
+FII_BB_MAX_ORDERS            = 5
+FII_BB_CSV                   = "fii_bb_continuation_alerts.csv"
+# State persists across the whole run (not reset daily) — the idea is to
+# watch each FII/DII stock continuously for 2-3 days as specified.
+FII_BB_ARMED: dict = {}   # symbol -> {direction, armed_high/low, armed_at, ikey}
+FII_BB_ALERTED_TODAY: set = set()   # one entry per symbol per day (reset daily)
+
 
 OPTION_PREMIUM_MIN_THRESHOLD = 1.0  # Minimum premium to consider
 OPTION_PREMIUM_MAX_THRESHOLD = 500.0  # Maximum premium to consider
@@ -4039,6 +4058,8 @@ def check_orb_time_and_process(access_token, live_data):
         RES_REVERSAL_ALERTED.clear()
         DUAL_TF_BB_ALERTED.clear()
         FIIDII_BRK_ALERTED.clear()
+        FII_BB_ALERTED_TODAY.clear()   # daily reset — but FII_BB_ARMED persists
+                                       # across days by design (continuous 2-3 day watch)
 
     # ── PRIMARY PASS ─────────────────────────────────────────────────────────
     # Old: only ran 09:20-09:25. Bot starting at 09:26 silently skipped ORB.
@@ -11146,6 +11167,159 @@ def _log_and_place_new_reversal(signal, trader, csv_file, strategy_name):
             print(f"⚠️ Order error for {s}: {e}")
 
 
+# ── Strategy 4: FII/DII BB-Mid Cross + Live Continuation ──────────────────────
+
+def scan_fii_bb_continuation(access_token, live_data):
+    """Continuous FII/DII watchlist monitor: 1H BB-middle cross → arm →
+    live intra-candle break of the armed candle's high/low → immediate entry.
+
+    Unlike detect_fiidii_confluence_breakout (mode='fii'), this is a single,
+    lightweight trigger with no weekly-high requirement and no 2-candle
+    confirmation — designed to fire fast right after the BB cross.
+
+    State (FII_BB_ARMED) persists across days: a stock arms today, may not
+    break until tomorrow or the day after — matches the '2-3 days continuous
+    monitoring' requirement. Un-arms automatically after FII_BB_ARM_MAX_HOURS
+    of market time if the break never happens.
+
+    Because entry is triggered on live LTP mid-candle, there is no "green
+    candle" confirmation possible — the buffer (FII_BB_ARM_BUFFER_PCT) is the
+    substitute noise filter, requiring price to clear the level meaningfully
+    rather than just touch it.
+    """
+    global FII_BB_ARMED, FII_BB_ALERTED_TODAY
+
+    if not ENABLE_FII_BB_CONTINUATION:
+        return []
+
+    signals = []
+    fii_symbols = FII_DII_STRONG_BUY | FII_DII_STRONG_SELL
+    pool_keys = [k for k in R3_LEVELS.keys()
+                 if R3_LEVELS[k].get('symbol') in fii_symbols]
+
+    now = now_ist()
+
+    for ikey in pool_keys:
+        info   = R3_LEVELS.get(ikey, {})
+        symbol = info.get('symbol', ikey)
+        live   = live_data.get(ikey, {})
+        ltp    = live.get('ltp', 0)
+        if not ltp:
+            continue
+
+        try:
+            # ── Step 1: if armed, check for un-arm timeout first ────────────
+            armed = FII_BB_ARMED.get(symbol)
+            if armed:
+                hours_armed = (now - armed['armed_at']).total_seconds() / 3600
+                if hours_armed > FII_BB_ARM_MAX_HOURS:
+                    del FII_BB_ARMED[symbol]
+                    armed = None
+                    if DEBUG_MODE:
+                        print(f"⏱ FII_BB un-armed (timeout): {symbol}")
+
+            # ── Step 2: if not armed, check for a fresh BB-middle cross ─────
+            if not armed and symbol not in FII_BB_ALERTED_TODAY:
+                df5 = fetch_5min_cached(access_token, ikey, bars=200, symbol=symbol)
+                if df5 is None or len(df5) < 30:
+                    continue
+
+                df1h = resample_to_1h(df5)
+                if df1h is None or len(df1h) < 22:
+                    continue
+
+                _, mid1h, _, _, _ = calculate_bollinger_bands(df1h, period=20)
+                if mid1h is None:
+                    continue
+
+                prev1h = df1h.iloc[-3]   # candle before the cross candle
+                last1h = df1h.iloc[-2]   # last COMPLETED 1H candle
+
+                body_pct = abs(last1h['close'] - last1h['open']) / last1h['open'] * 100 \
+                           if last1h['open'] else 0
+                if body_pct < FII_BB_NOISE_MIN_BODY_PCT:
+                    continue   # indecisive cross candle, skip arming
+
+                cross_up   = prev1h['close'] < float(mid1h.iloc[-3]) and \
+                             last1h['close'] > float(mid1h.iloc[-2])
+                cross_down = prev1h['close'] > float(mid1h.iloc[-3]) and \
+                             last1h['close'] < float(mid1h.iloc[-2])
+
+                if cross_up:
+                    FII_BB_ARMED[symbol] = {
+                        'direction':  'CE',
+                        'armed_high': float(last1h['high']),
+                        'armed_low':  float(last1h['low']),
+                        'armed_at':   now,
+                        'ikey':       ikey,
+                    }
+                    if DEBUG_MODE:
+                        print(f"🔫 FII_BB armed CE: {symbol} @ high ₹{last1h['high']:.2f}")
+                elif cross_down:
+                    FII_BB_ARMED[symbol] = {
+                        'direction':  'PE',
+                        'armed_high': float(last1h['high']),
+                        'armed_low':  float(last1h['low']),
+                        'armed_at':   now,
+                        'ikey':       ikey,
+                    }
+                    if DEBUG_MODE:
+                        print(f"🔫 FII_BB armed PE: {symbol} @ low ₹{last1h['low']:.2f}")
+                continue   # armed this scan — wait for a later scan to check break
+
+            # ── Step 3: if armed, check live LTP break (immediate, no wait) ──
+            if armed:
+                direction = armed['direction']
+
+                if direction == 'CE':
+                    trigger = armed['armed_high'] * (1 + FII_BB_ARM_BUFFER_PCT / 100)
+                    if ltp > trigger:
+                        stop   = armed['armed_low'] * 0.998
+                        risk   = ltp - stop
+                        target = ltp + 2.0 * risk if risk > 0 else ltp * 1.015
+                        fii_sig = get_fii_dii_signal(symbol)
+                        FII_BB_ALERTED_TODAY.add(symbol)
+                        del FII_BB_ARMED[symbol]
+                        signals.append({
+                            'symbol': symbol, 'ikey': ikey,
+                            'signal': 'FII_BB_CONTINUATION_CE', 'direction': 'CE',
+                            'entry': ltp, 'stop': stop, 'target': target,
+                            'armed_high': armed['armed_high'],
+                            'fii_dii': fii_sig,
+                            'confidence': 'HIGH' if fii_sig in ('STRONG_BUY','BUY') else 'MEDIUM',
+                            'timestamp': now,
+                        })
+                        if DEBUG_MODE:
+                            print(f"🟢 FII_BB_CONTINUATION CE: {symbol} broke ₹{armed['armed_high']:.2f} live @ ₹{ltp:.2f}")
+
+                else:  # PE
+                    trigger = armed['armed_low'] * (1 - FII_BB_ARM_BUFFER_PCT / 100)
+                    if ltp < trigger:
+                        stop   = armed['armed_high'] * 1.002
+                        risk   = stop - ltp
+                        target = ltp - 2.0 * risk if risk > 0 else ltp * 0.985
+                        fii_sig = get_fii_dii_signal(symbol)
+                        FII_BB_ALERTED_TODAY.add(symbol)
+                        del FII_BB_ARMED[symbol]
+                        signals.append({
+                            'symbol': symbol, 'ikey': ikey,
+                            'signal': 'FII_BB_CONTINUATION_PE', 'direction': 'PE',
+                            'entry': ltp, 'stop': stop, 'target': target,
+                            'armed_low': armed['armed_low'],
+                            'fii_dii': fii_sig,
+                            'confidence': 'HIGH' if fii_sig in ('STRONG_SELL','SELL') else 'MEDIUM',
+                            'timestamp': now,
+                        })
+                        if DEBUG_MODE:
+                            print(f"🔴 FII_BB_CONTINUATION PE: {symbol} broke ₹{armed['armed_low']:.2f} live @ ₹{ltp:.2f}")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ scan_fii_bb_continuation [{symbol}]: {e}")
+
+    return signals
+
+
 def monitor_session_phase(live_data, access_token, trader=None):
     """Dispatcher: routes to the correct strategy based on current session phase.
 
@@ -11553,6 +11727,14 @@ def enhanced_monitor(access_token, keys, symbols):
                             print(f"{'='*80}")
                             if trader:
                                 place_breakout_order(sig, trader)
+
+                    # ── S4: FII/DII BB-mid cross + live continuation ──────────
+                    # Runs EVERY scan (not throttled) — immediate live-break
+                    # detection is the whole point of this strategy.
+                    if ENABLE_FII_BB_CONTINUATION:
+                        fii_bb_sigs = scan_fii_bb_continuation(access_token, live_data)
+                        for sig in fii_bb_sigs:
+                            _log_and_place_new_reversal(sig, trader, FII_BB_CSV, "FII/DII BB CONTINUATION")
 
                     # ── New Reversal Strategies (throttled: every 2 scans) ────
                     if scan_count % 2 == 0:
