@@ -460,6 +460,7 @@ DUAL_TF_BB_ALERTED              = set()
 #   Both require: previous candle AND new candle both close above/below level,
 #                 sudden volume (≥ 2× avg), and FII/DII alignment for mode B.
 ENABLE_FIIDII_BREAKOUT          = True
+ENABLE_FIIDII_BREAKOUT_V2       = True   # rolling-anchor + strong-close variant
 FIIDII_BRK_LOOKBACK_DAYS_GEN    = 7        # Mode A: 1-week weekly high lookback
 FIIDII_BRK_LOOKBACK_DAYS_FII    = 14       # Mode B: 2-week lookback
 FIIDII_BRK_VOLUME_MIN           = 1.8      # volume spike threshold
@@ -10958,6 +10959,17 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
       • Lookback extended to 14 days
       • Noise gate: candle body ≥ FIIDII_BRK_NOISE_MIN_BODY_PCT
 
+    Mode 'fii_v2' (Mode C — rolling BB-cross + strong-close variant):
+      Same FII/DII pool + weekly-high filter + volume spike as Mode B, but:
+      • Breakout reference = ROLLING previous 1-hr candle (not fixed to the
+        day's first 1H bar) — fires at any point in the day, not just once
+        off the opening range.
+      • The BB-cross candle itself must CLOSE STRONG in the trade direction
+        (green for CE, red for PE) — quality filter on the arming candle,
+        not required in Mode B.
+      • 2-candle confirmation still required (stricter than the 1-candle
+        break originally requested — kept as the noise filter).
+
     'If price reverses with small candles or small price changes → ignore
     and continue waiting.' — implemented via the noise gate and 2-candle confirm.
     """
@@ -10965,9 +10977,9 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
     if not ENABLE_FIIDII_BREAKOUT:
         return []
 
-    lookback  = FIIDII_BRK_LOOKBACK_DAYS_FII if mode == 'fii' else FIIDII_BRK_LOOKBACK_DAYS_GEN
+    lookback  = FIIDII_BRK_LOOKBACK_DAYS_FII if mode in ('fii', 'fii_v2') else FIIDII_BRK_LOOKBACK_DAYS_GEN
     pool_keys = list(R3_LEVELS.keys())
-    if mode == 'fii':
+    if mode in ('fii', 'fii_v2'):
         fii_symbols = FII_DII_STRONG_BUY | FII_DII_STRONG_SELL
         pool_keys   = [k for k in pool_keys
                        if R3_LEVELS[k].get('symbol') in fii_symbols]
@@ -11010,6 +11022,16 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
             first_1h_low  = float(df1h.iloc[0]['low'])
             last_1h       = df1h.iloc[-2]   # last completed 1-hr bar
 
+            # ── fii_v2: rolling previous-1H-candle anchor (not day's first bar) ──
+            # Mode B anchors to the day's opening range; Mode C anchors to
+            # whichever 1H candle most recently crossed the BB middle, so it
+            # can fire at any point in the session, not just once at the open.
+            rolling_1h_high = float(df1h.iloc[-3]['high']) if len(df1h) >= 3 else first_1h_high
+            rolling_1h_low  = float(df1h.iloc[-3]['low'])  if len(df1h) >= 3 else first_1h_low
+
+            anchor_high = rolling_1h_high if mode == 'fii_v2' else first_1h_high
+            anchor_low  = rolling_1h_low  if mode == 'fii_v2' else first_1h_low
+
             # ── Weekly high/low WITHOUT wick (body only) ─────────────────────
             weekly_res, weekly_sup = _get_weekly_high_low_body(
                 access_token, ikey, symbol, lookback_days=lookback)
@@ -11038,10 +11060,12 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
 
             fii_sig = get_fii_dii_signal(symbol)
 
-            # ── Mode B: BB middle cross on 1H ────────────────────────────────
+            # ── Mode B/C: BB middle cross on 1H ──────────────────────────────
             bb_ok_bull = True
             bb_ok_bear = True
-            if mode == 'fii':
+            strong_close_bull = True   # only enforced for fii_v2
+            strong_close_bear = True
+            if mode in ('fii', 'fii_v2'):
                 _, mid1h_s, _, _, _ = calculate_bollinger_bands(df1h, period=20)
                 if mid1h_s is not None and len(df1h) >= 22:
                     prev_1h = df1h.iloc[-3]
@@ -11051,15 +11075,21 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
                     bb_ok_bear = (prev_1h['close'] > float(mid1h_s.iloc[-3]) and
                                   last_1h_row['close'] < float(mid1h_s.iloc[-2]))
 
-            # ── LONG (CE): break above first-1H-high AND weekly-body-high ────
+                    if mode == 'fii_v2':
+                        # The BB-cross candle itself must close strong in the
+                        # trade direction — quality filter not present in Mode B.
+                        strong_close_bull = last_1h_row['close'] > last_1h_row['open']
+                        strong_close_bear = last_1h_row['close'] < last_1h_row['open']
+
+            # ── LONG (CE): break above anchor-high AND weekly-body-high ──────
             # "Previous candle AND new candle break" = 2-candle close confirmation
-            long_level = max(first_1h_high, weekly_res)
+            long_level = max(anchor_high, weekly_res)
             two_close_bull = (prev5['close'] > long_level and
                               last5['close'] > long_level)
-            fii_bull_ok = mode != 'fii' or fii_sig in ('STRONG_BUY', 'BUY')
+            fii_bull_ok = mode not in ('fii', 'fii_v2') or fii_sig in ('STRONG_BUY', 'BUY')
 
-            if two_close_bull and bb_ok_bull and fii_bull_ok:
-                stop   = first_1h_low * 0.997
+            if two_close_bull and bb_ok_bull and strong_close_bull and fii_bull_ok:
+                stop   = anchor_low * 0.997
                 risk   = ltp - stop
                 target = ltp + 2.5 * risk if risk > 0 else ltp * 1.02
                 confidence = ('VERY_HIGH' if fii_sig in ('STRONG_BUY',) else 'HIGH')
@@ -11070,7 +11100,7 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
                     'direction': 'CE',
                     'entry': ltp, 'stop': stop, 'target': target,
                     'level': long_level,
-                    'first_1h_high': first_1h_high, 'weekly_res': weekly_res,
+                    'anchor_high': anchor_high, 'weekly_res': weekly_res,
                     'vol_ratio': round(vol_ratio, 2),
                     'fii_dii': fii_sig, 'confidence': confidence,
                     'timestamp': now_ist(),
@@ -11079,14 +11109,14 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
                     print(f"🟢 FIIDII_BRK CE [{mode}]: {symbol} | level ₹{long_level:.2f} | vol {vol_ratio:.2f}x")
                 continue
 
-            # ── SHORT (PE): break below first-1H-low AND weekly-body-low ─────
-            short_level = min(first_1h_low, weekly_sup)
+            # ── SHORT (PE): break below anchor-low AND weekly-body-low ───────
+            short_level = min(anchor_low, weekly_sup)
             two_close_bear = (prev5['close'] < short_level and
                               last5['close'] < short_level)
-            fii_bear_ok = mode != 'fii' or fii_sig in ('STRONG_SELL', 'SELL')
+            fii_bear_ok = mode not in ('fii', 'fii_v2') or fii_sig in ('STRONG_SELL', 'SELL')
 
-            if two_close_bear and bb_ok_bear and fii_bear_ok:
-                stop   = first_1h_high * 1.003
+            if two_close_bear and bb_ok_bear and strong_close_bear and fii_bear_ok:
+                stop   = anchor_high * 1.003
                 risk   = stop - ltp
                 target = ltp - 2.5 * risk if risk > 0 else ltp * 0.98
                 confidence = ('VERY_HIGH' if fii_sig in ('STRONG_SELL',) else 'HIGH')
@@ -11097,7 +11127,7 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
                     'direction': 'PE',
                     'entry': ltp, 'stop': stop, 'target': target,
                     'level': short_level,
-                    'first_1h_low': first_1h_low, 'weekly_sup': weekly_sup,
+                    'anchor_low': anchor_low, 'weekly_sup': weekly_sup,
                     'vol_ratio': round(vol_ratio, 2),
                     'fii_dii': fii_sig, 'confidence': confidence,
                     'timestamp': now_ist(),
@@ -11764,6 +11794,13 @@ def enhanced_monitor(access_token, keys, symbols):
                                 access_token, live_data, mode='fii')
                             for sig in fii_sigs:
                                 _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "FII/DII CONFLUENCE")
+
+                        # S3c: FII/DII rolling-anchor + strong-close variant
+                        if ENABLE_FIIDII_BREAKOUT_V2:
+                            fii_v2_sigs = detect_fiidii_confluence_breakout(
+                                access_token, live_data, mode='fii_v2')
+                            for sig in fii_v2_sigs:
+                                _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "FII/DII BB-CROSS V2")
 
                     for key, live in live_data.items():
                         if key in R3_LEVELS:
