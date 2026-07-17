@@ -10941,7 +10941,8 @@ def detect_dual_tf_bb_cross(access_token, live_data):
 
 # ── Strategy 3: FII/DII Multi-Confluence Breakout ─────────────────────────────
 
-def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
+def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii',
+                                       confirm_style=None):
     """Multi-confluence breakout for FII/DII stocks (and general pool).
 
     Mode 'general' (Mode A — all F&O symbols):
@@ -10967,15 +10968,30 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
       • The BB-cross candle itself must CLOSE STRONG in the trade direction
         (green for CE, red for PE) — quality filter on the arming candle,
         not required in Mode B.
-      • 2-candle confirmation still required (stricter than the 1-candle
-        break originally requested — kept as the noise filter).
+
+    confirm_style (independent of mode — controls HOW the breakout is
+    confirmed once the reference level is set):
+      'two_candle' (default for 'general'/'fii'):
+        Requires the PREVIOUS 5-min close AND the NEW 5-min close to both
+        be beyond the level — the stricter noise filter used originally.
+      'prev_candle_break' (default for 'fii_v2'):
+        Looser: the current candle's CLOSE must be beyond the weekly level,
+        AND the current candle's high/low must break the PREVIOUS candle's
+        high/low (not the weekly level). Only ONE candle needs to close
+        beyond the weekly level — no 2-candle-same-level requirement.
+        This matches: "next candle closes above weekly high AND current
+        candle breaks previous candle's high."
 
     'If price reverses with small candles or small price changes → ignore
-    and continue waiting.' — implemented via the noise gate and 2-candle confirm.
+    and continue waiting.' — implemented via the noise gate (both styles).
     """
     global FIIDII_BRK_ALERTED
     if not ENABLE_FIIDII_BREAKOUT:
         return []
+
+    # Default confirm_style per mode if not explicitly overridden
+    if confirm_style is None:
+        confirm_style = 'prev_candle_break' if mode == 'fii_v2' else 'two_candle'
 
     lookback  = FIIDII_BRK_LOOKBACK_DAYS_FII if mode in ('fii', 'fii_v2') else FIIDII_BRK_LOOKBACK_DAYS_GEN
     pool_keys = list(R3_LEVELS.keys())
@@ -11082,13 +11098,22 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
                         strong_close_bear = last_1h_row['close'] < last_1h_row['open']
 
             # ── LONG (CE): break above anchor-high AND weekly-body-high ──────
-            # "Previous candle AND new candle break" = 2-candle close confirmation
             long_level = max(anchor_high, weekly_res)
-            two_close_bull = (prev5['close'] > long_level and
-                              last5['close'] > long_level)
+
+            if confirm_style == 'two_candle':
+                # "Previous candle AND new candle break" = 2-candle SAME-LEVEL close
+                confirm_bull = (prev5['close'] > long_level and
+                                last5['close'] > long_level)
+            else:  # 'prev_candle_break'
+                # Current candle closes beyond the weekly level, AND its high
+                # also breaks the PREVIOUS candle's high (not the weekly level
+                # a second time) — looser, single-level confirmation.
+                confirm_bull = (last5['close'] > long_level and
+                                last5['high'] > prev5['high'])
+
             fii_bull_ok = mode not in ('fii', 'fii_v2') or fii_sig in ('STRONG_BUY', 'BUY')
 
-            if two_close_bull and bb_ok_bull and strong_close_bull and fii_bull_ok:
+            if confirm_bull and bb_ok_bull and strong_close_bull and fii_bull_ok:
                 stop   = anchor_low * 0.997
                 risk   = ltp - stop
                 target = ltp + 2.5 * risk if risk > 0 else ltp * 1.02
@@ -11101,21 +11126,28 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
                     'entry': ltp, 'stop': stop, 'target': target,
                     'level': long_level,
                     'anchor_high': anchor_high, 'weekly_res': weekly_res,
+                    'confirm_style': confirm_style,
                     'vol_ratio': round(vol_ratio, 2),
                     'fii_dii': fii_sig, 'confidence': confidence,
                     'timestamp': now_ist(),
                 })
                 if DEBUG_MODE:
-                    print(f"🟢 FIIDII_BRK CE [{mode}]: {symbol} | level ₹{long_level:.2f} | vol {vol_ratio:.2f}x")
+                    print(f"🟢 FIIDII_BRK CE [{mode}/{confirm_style}]: {symbol} | level ₹{long_level:.2f} | vol {vol_ratio:.2f}x")
                 continue
 
             # ── SHORT (PE): break below anchor-low AND weekly-body-low ───────
             short_level = min(anchor_low, weekly_sup)
-            two_close_bear = (prev5['close'] < short_level and
-                              last5['close'] < short_level)
+
+            if confirm_style == 'two_candle':
+                confirm_bear = (prev5['close'] < short_level and
+                                last5['close'] < short_level)
+            else:  # 'prev_candle_break'
+                confirm_bear = (last5['close'] < short_level and
+                                last5['low'] < prev5['low'])
+
             fii_bear_ok = mode not in ('fii', 'fii_v2') or fii_sig in ('STRONG_SELL', 'SELL')
 
-            if two_close_bear and bb_ok_bear and strong_close_bear and fii_bear_ok:
+            if confirm_bear and bb_ok_bear and strong_close_bear and fii_bear_ok:
                 stop   = anchor_high * 1.003
                 risk   = stop - ltp
                 target = ltp - 2.5 * risk if risk > 0 else ltp * 0.98
@@ -11128,12 +11160,13 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii'):
                     'entry': ltp, 'stop': stop, 'target': target,
                     'level': short_level,
                     'anchor_low': anchor_low, 'weekly_sup': weekly_sup,
+                    'confirm_style': confirm_style,
                     'vol_ratio': round(vol_ratio, 2),
                     'fii_dii': fii_sig, 'confidence': confidence,
                     'timestamp': now_ist(),
                 })
                 if DEBUG_MODE:
-                    print(f"🔴 FIIDII_BRK PE [{mode}]: {symbol} | level ₹{short_level:.2f} | vol {vol_ratio:.2f}x")
+                    print(f"🔴 FIIDII_BRK PE [{mode}/{confirm_style}]: {symbol} | level ₹{short_level:.2f} | vol {vol_ratio:.2f}x")
 
         except Exception as e:
             if DEBUG_MODE:
