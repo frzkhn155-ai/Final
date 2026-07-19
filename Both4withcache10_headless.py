@@ -630,6 +630,20 @@ ORB_15_BREAKOUT_WINDOW_MINUTES  = 45      # trade within 45 min of 09:30 close (
 ORB_15_MIN_VOLUME               = 500000  # same liquidity floor as 5-min ORB
 ORB_15_MAX_ORDERS               = 5
 
+# ── ORB-15 Reversal (contra-trade) config ────────────────────────────────────
+# Mirrors ORB_ENABLE_REVERSAL_TRADE above, but for the 15-min opening range.
+# Since the ORB-15 breakout window is wider (45 min vs 30), the reversal
+# window and cooldown are scaled up proportionally.
+ORB_15_ENABLE_REVERSAL_TRADE     = True
+ORB_15_REVERSAL_MIN_MOVE_PCT     = 0.8    # same threshold as 5-min ORB reversal
+ORB_15_REVERSAL_CANDLES_MIN      = 2
+ORB_15_REVERSAL_COOLDOWN_MINUTES = 20     # slightly longer cooldown (wider OR)
+ORB_15_REVERSAL_REQUIRE_OR_BREAK = True
+ORB_15_REVERSAL_REQUIRE_HA       = True
+ORB_15_REVERSAL_REQUIRE_TOPPING  = True
+ORB_15_REVERSAL_WINDOW_MINUTES   = 105    # scaled from 90 (5-min ORB) for the wider OR
+ORB_15_REVERSAL_ALERTED: set = set()      # symbols that fired an ORB-15 reversal today
+
 ORB_15_SIGNALS: dict = {}          # symbol -> orb signal dict (built at 09:30)
 ORB_15_ALERTED_STOCKS: set = set() # symbols that already fired a breakout today
 ORB_15_LATE_CHECKED: set = set()   # zero-volume retry set (mirrors ORB_LATE_CHECKED)
@@ -4263,6 +4277,252 @@ def send_orb_15_alert(signal, trader=None):
         print(f"⚠️ ORB-15 order limit reached ({ORB_15_ORDER_COUNT}/{ORB_15_MAX_ORDERS}) — signal logged only")
 
 
+def check_orb_15_reversal(symbol, ltp, volume, live_data, access_token, trader=None):
+    """ORB-15 reversal — mirrors check_orb_reversal() exactly, but keyed to
+    ORB_15_SIGNALS / ORB_15_REVERSAL_ALERTED and using the ORB_15_REVERSAL_*
+    config (wider window/cooldown to match the 15-min opening range).
+
+    Same MANKIND-case rationale as the 5-min ORB reversal: the initial
+    ORB-15 breakout signal can go wrong, and this catches the opposite move
+    with topping/bottoming pattern + HA colour flip dual confirmation.
+    """
+    global ORB_15_REVERSAL_ALERTED
+
+    if not ORB_15_ENABLE_REVERSAL_TRADE:
+        return None
+    if symbol not in ORB_15_SIGNALS:
+        return None
+    if symbol in ORB_15_REVERSAL_ALERTED:
+        return None
+
+    orb = ORB_15_SIGNALS[symbol]
+    original_direction = orb.get('direction', '')
+    signal_time = orb.get('signal_time')
+
+    if signal_time is not None:
+        elapsed = (now_ist() - signal_time).total_seconds() / 60
+        if elapsed > ORB_15_REVERSAL_WINDOW_MINUTES:
+            if DEBUG_MODE:
+                print(f"⛔ ORB-15 reversal window expired for {symbol} "
+                      f"({elapsed:.0f}min > {ORB_15_REVERSAL_WINDOW_MINUTES}min)")
+            return None
+        if elapsed < ORB_15_REVERSAL_COOLDOWN_MINUTES:
+            if DEBUG_MODE:
+                print(f"⛔ ORB-15 reversal cooldown for {symbol} "
+                      f"({elapsed:.0f}min < {ORB_15_REVERSAL_COOLDOWN_MINUTES}min)")
+            return None
+
+    breakout_level = orb.get('breakout_level', ltp)
+    or_level = orb.get('stop_level')
+    if original_direction == 'SELL':
+        adverse_move_pct = (ltp - breakout_level) / breakout_level * 100
+        reversal_direction = 'BUY'
+        reversal_signal_type = 'ORB_15_REVERSAL_LONG'
+    else:
+        adverse_move_pct = (breakout_level - ltp) / breakout_level * 100
+        reversal_direction = 'SELL'
+        reversal_signal_type = 'ORB_15_REVERSAL_SHORT'
+
+    if adverse_move_pct < ORB_15_REVERSAL_MIN_MOVE_PCT:
+        if DEBUG_MODE:
+            print(f"⛔ ORB-15 reversal: {symbol} adverse move {adverse_move_pct:.2f}% "
+                  f"< min {ORB_15_REVERSAL_MIN_MOVE_PCT}%")
+        return None
+
+    if ORB_15_REVERSAL_REQUIRE_OR_BREAK and or_level:
+        if reversal_direction == 'SELL' and ltp >= or_level:
+            if DEBUG_MODE:
+                print(f"⛔ ORB-15 reversal: {symbol} ltp {ltp:.2f} has not broken OR low {or_level:.2f}")
+            return None
+        if reversal_direction == 'BUY' and ltp <= or_level:
+            if DEBUG_MODE:
+                print(f"⛔ ORB-15 reversal: {symbol} ltp {ltp:.2f} has not broken OR high {or_level:.2f}")
+            return None
+
+    ikey = orb.get('instrument_key') or SYMBOL_TO_ISIN.get(symbol, '')
+    klinger_info = R3_LEVELS.get(ikey, {}).get('klinger') if ikey else None
+
+    try:
+        df = fetch_5min_cached(access_token, ikey, bars=60, symbol=symbol)
+        n = len(df) if df is not None else 0
+        if df is None or n < 5:
+            if DEBUG_MODE:
+                print(f"⛔ ORB-15 reversal: {symbol} insufficient candle data ({n} bars)")
+            return None
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⛔ ORB-15 reversal: {symbol} candle fetch error: {e}")
+        return None
+
+    if len(df) < ORB_15_REVERSAL_CANDLES_MIN:
+        if DEBUG_MODE:
+            print(f"⛔ ORB-15 reversal: {symbol} too few candles "
+                  f"({len(df)} < {ORB_15_REVERSAL_CANDLES_MIN})")
+        return None
+
+    # ── Gate 1: topping/bottoming pattern ──────────────────────────────────
+    topping_confirmed = False
+    if ORB_15_REVERSAL_REQUIRE_TOPPING:
+        try:
+            if reversal_direction == 'SELL':
+                topping_result = detect_topping_reversal(df, klinger_data=klinger_info, strict=False)
+                topping_confirmed = topping_result is not None
+            else:
+                df_inv = df.copy()
+                df_inv['high']  = -df['low']
+                df_inv['low']   = -df['high']
+                df_inv['open']  = -df['open']
+                df_inv['close'] = -df['close']
+                topping_result = detect_topping_reversal(df_inv, klinger_data=klinger_info, strict=False)
+                topping_confirmed = topping_result is not None
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ ORB-15 reversal: detect_topping_reversal error for {symbol}: {e}")
+            topping_confirmed = False
+
+    # ── Gate 2: HA colour flip ──────────────────────────────────────────────
+    ha_confirmed = False
+    if ORB_15_REVERSAL_REQUIRE_HA:
+        try:
+            ha_watch_signal = 'SHORT' if reversal_direction == 'BUY' else 'LONG'
+            ha_result = _ha_analyse_symbol(access_token, symbol, ikey, ha_watch_signal)
+            if ha_result is not None:
+                ha_confirmed = ha_result.get('needs_alert', False)
+                if DEBUG_MODE and ha_confirmed:
+                    c2 = ha_result.get('c_prev2', '?')
+                    c1 = ha_result.get('c_prev1', '?')
+                    cl = ha_result.get('c_last', '?')
+                    print(f"✅ ORB-15 reversal HA flip confirmed for {symbol}: [{c2}]→[{c1}]→[{cl}]")
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ ORB-15 reversal: HA check error for {symbol}: {e}")
+            ha_confirmed = False
+
+    if ORB_15_REVERSAL_REQUIRE_TOPPING and not topping_confirmed:
+        if DEBUG_MODE:
+            print(f"⛔ ORB-15 reversal: {symbol} topping/bottoming pattern not confirmed")
+        return None
+
+    if ORB_15_REVERSAL_REQUIRE_HA and not ha_confirmed:
+        if DEBUG_MODE:
+            print(f"⛔ ORB-15 reversal: {symbol} HA colour flip not confirmed")
+        return None
+
+    # ── Volume: reuse ORB-15's looser 1.2x threshold ────────────────────────
+    rvol, _, _ = compute_intraday_rvol(symbol, access_token, ikey)
+    volume_ratio = rvol if rvol is not None else 0.0
+    if rvol is not None and rvol < ORB_15_VOLUME_CONFIRMATION:
+        if DEBUG_MODE:
+            print(f"⛔ ORB-15 reversal: {symbol} RVOL {rvol:.2f}x < {ORB_15_VOLUME_CONFIRMATION}x")
+        return None
+
+    last_candle = df.iloc[-1]
+    if reversal_direction == 'BUY':
+        entry_price = ltp
+        stop_loss   = last_candle['low'] * 0.997
+        risk        = entry_price - stop_loss
+        if risk <= 0:
+            return None
+        target      = entry_price + 2.0 * risk
+    else:
+        entry_price = ltp
+        stop_loss   = last_candle['high'] * 1.003
+        risk        = stop_loss - entry_price
+        if risk <= 0:
+            return None
+        target      = entry_price - 2.0 * risk
+
+    risk_reward = abs(target - entry_price) / risk if risk > 0 else 0
+
+    ORB_15_REVERSAL_ALERTED.add(symbol)
+
+    return {
+        'symbol':           symbol,
+        'signal':           reversal_signal_type,
+        'direction':        reversal_direction,
+        'entry_price':      entry_price,
+        'stop_loss':        stop_loss,
+        'target':           target,
+        'volume_ratio':     volume_ratio,
+        'risk':             risk,
+        'reward':           abs(target - entry_price),
+        'risk_reward':      risk_reward,
+        'confidence':       orb.get('confidence', 'HIGH'),
+        'fii_dii_signal':   orb.get('fii_dii_signal', 'NEUTRAL'),
+        'orb_data':         orb,
+        'adverse_move_pct': adverse_move_pct,
+        'topping_confirmed': topping_confirmed,
+        'ha_confirmed':     ha_confirmed,
+        'entry_type':       'ORB_15_REVERSAL',
+        'original_direction': original_direction,
+    }
+
+
+def send_orb_15_reversal_alert(signal, trader=None):
+    """Mirrors send_orb_reversal_alert() — own order counter, own CSV/log
+    files, own max-orders cap. Fully independent of the 5-min ORB reversal.
+    """
+    global ORB_15_ORDER_COUNT
+
+    orig_dir = signal.get('original_direction', '?')
+    arrow    = '🟢' if signal['direction'] == 'BUY' else '🔴'
+
+    print("\n" + "=" * 100)
+    print(f"{arrow} ORB-15 REVERSAL SIGNAL: {signal['symbol']} {arrow}")
+    print("=" * 100)
+    print(f"  Original ORB-15 direction : {orig_dir}  →  NOW REVERSING to {signal['direction']}")
+    print(f"  Signal type               : {signal['signal']}")
+    print(f"  Adverse move vs ORB-15    : {signal['adverse_move_pct']:.2f}%")
+    print(f"  Topping/Bottoming patt    : {'✅ YES' if signal['topping_confirmed'] else '⚠️ NO'}")
+    print(f"  HA colour flip            : {'✅ YES' if signal['ha_confirmed'] else '⚠️ NO'}")
+    print(f"  Confidence                : {signal['confidence']}")
+    print(f"  FII/DII signal            : {signal['fii_dii_signal']}")
+    print(f"  Entry Price               : ₹{signal['entry_price']:.2f}")
+    print(f"  Stop Loss                 : ₹{signal['stop_loss']:.2f}")
+    print(f"  Target                    : ₹{signal['target']:.2f}")
+    print(f"  Risk : Reward             : {signal['risk_reward']:.2f}:1")
+    print(f"  Volume                    : {signal['volume_ratio']:.2f}x average (threshold {ORB_15_VOLUME_CONFIRMATION}x)")
+    print("=" * 100)
+
+    log_orb_15_trade(signal, 'REVERSAL_ENTRY')
+
+    try:
+        with open(ORB_15_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*100}\n")
+            f.write(f"ORB-15 REVERSAL ALERT: {now_ist().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Symbol: {signal['symbol']} | Original: {orig_dir} → Reversal: {signal['direction']}\n")
+            f.write(f"Adverse move: {signal['adverse_move_pct']:.2f}% | Topping: {signal['topping_confirmed']} | HA: {signal['ha_confirmed']}\n")
+            f.write(f"Entry: ₹{signal['entry_price']:.2f} | Stop: ₹{signal['stop_loss']:.2f} | Target: ₹{signal['target']:.2f}\n")
+            f.write(f"R:R: {signal['risk_reward']:.2f}:1 | Volume: {signal['volume_ratio']:.2f}x\n")
+            f.write(f"{'='*100}\n")
+    except Exception:
+        pass
+
+    if ENABLE_AUTO_TRADING and trader and ORB_15_ORDER_COUNT < ORB_15_MAX_ORDERS:
+        if not is_order_time_allowed():
+            print(f"⏭️  ORB-15 Reversal {signal['symbol']}: order skipped — outside trading hours")
+            return
+        print(f"\n📤 Placing ORB-15 REVERSAL {signal['direction']} order for {signal['symbol']}...")
+        orb15_breakout = {
+            'symbol':         signal['symbol'],
+            'instrument_key': signal.get('orb_data', {}).get('instrument_key', ''),
+            'breakout_type':  'CE' if signal['direction'] == 'BUY' else 'PE',
+            'strategy':       'ORB_15_REVERSAL',
+            'entry_price':    signal['entry_price'],
+            'stop_loss':      signal['stop_loss'],
+            'target':         signal['target'],
+            'klinger_status': signal.get('orb_data', {}).get('klinger_at_signal'),
+        }
+        order_id = place_breakout_order(orb15_breakout, trader)
+        if order_id:
+            ORB_15_ORDER_COUNT += 1
+            print(f"✅ ORB-15 Reversal order placed: {order_id} | ORB-15 orders today: {ORB_15_ORDER_COUNT}/{ORB_15_MAX_ORDERS}")
+        else:
+            print(f"⚠️ ORB-15 Reversal order failed for {signal['symbol']}")
+    elif ORB_15_ORDER_COUNT >= ORB_15_MAX_ORDERS:
+        print(f"⚠️ ORB-15 order limit reached ({ORB_15_ORDER_COUNT}/{ORB_15_MAX_ORDERS}) — reversal signal logged only")
+
+
 def check_orb_15_time_and_process(access_token, live_data):
     """Time-trigger for ORB-15, mirroring check_orb_time_and_process() but
     anchored to ORB_15_SNAPSHOT_TIME (09:30) instead of 09:20.
@@ -4290,9 +4550,8 @@ def check_orb_15_time_and_process(access_token, live_data):
 
 
 def monitor_orb_15_breakouts(live_data, access_token='', trader=None):
-    """Mirrors monitor_orb_breakouts() — scans ORB_15_SIGNALS for breakouts
-    on every live_data tick. No reversal logic in this first pass (breakout
-    signal only, per the current scope).
+    """Mirrors monitor_orb_breakouts() — scans ORB_15_SIGNALS for breakouts,
+    and falls through to the ORB-15 reversal check when no breakout fires.
     """
     if not ENABLE_ORB_15 or not ORB_15_SIGNALS:
         return
@@ -4308,6 +4567,13 @@ def monitor_orb_15_breakouts(live_data, access_token='', trader=None):
             breakout = check_orb_15_breakout(symbol, ltp, volume, data, access_token)
             if breakout:
                 send_orb_15_alert(breakout, trader)
+                continue   # already acting on continuation — skip reversal check
+
+            # ── ORB-15 Reversal check: price moving against original signal ──
+            if ORB_15_ENABLE_REVERSAL_TRADE and symbol not in ORB_15_REVERSAL_ALERTED:
+                reversal = check_orb_15_reversal(symbol, ltp, volume, data, access_token, trader)
+                if reversal:
+                    send_orb_15_reversal_alert(reversal, trader)
         except Exception as e:
             if DEBUG_MODE:
                 print(f"ORB-15 monitor error {symbol_key}: {e}")
@@ -4383,6 +4649,7 @@ def check_orb_time_and_process(access_token, live_data):
         ORB_15_LATE_CHECKED.clear()
         ORB_15_PROCESSED_TODAY = False
         ORB_15_ORDER_COUNT = 0
+        ORB_15_REVERSAL_ALERTED.clear()
 
     # ── PRIMARY PASS ─────────────────────────────────────────────────────────
     # Old: only ran 09:20-09:25. Bot starting at 09:26 silently skipped ORB.
@@ -12052,7 +12319,8 @@ def enhanced_monitor(access_token, keys, symbols):
                         monitor_orb_15_breakouts(live_data, access_token, trader)
                         if DEBUG_MODE:
                             print(f"🔍 ORB-15: {len(ORB_15_SIGNALS)} signals tracked, "
-                                  f"{len(ORB_15_ALERTED_STOCKS)} alerted today")
+                                  f"{len(ORB_15_ALERTED_STOCKS)} breakout-alerted, "
+                                  f"{len(ORB_15_REVERSAL_ALERTED)} reversal-alerted today")
                     except Exception as e:
                         print(f"❌ ORB-15 strategy error: {e}")
                         if DEBUG_MODE:
