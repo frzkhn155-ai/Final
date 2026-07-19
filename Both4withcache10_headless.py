@@ -11703,16 +11703,35 @@ def enhanced_monitor(access_token, keys, symbols):
                 # Phase 1 (09:15–10:30): ORB handled below
                 # Phase 2 (10:30–13:00): Midday Box build + breakout
                 # Phase 3 (13:00–15:15): Afternoon Pivot R3/S3 reversal
-                monitor_session_phase(live_data, access_token, trader)
+                # Isolated: a failure here must not block ORB/reversal/S1-S4 below.
+                try:
+                    monitor_session_phase(live_data, access_token, trader)
+                except Exception as e:
+                    print(f"❌ monitor_session_phase error: {e}")
+                    if DEBUG_MODE:
+                        import traceback
+                        traceback.print_exc()
 
                 # Check ORB time and process if needed (Phase 1 only)
                 if ENABLE_ORB_STRATEGY:
-                    check_orb_time_and_process(access_token, live_data)
-                    monitor_orb_breakouts(live_data, access_token, trader)
+                    try:
+                        check_orb_time_and_process(access_token, live_data)
+                        monitor_orb_breakouts(live_data, access_token, trader)
+                    except Exception as e:
+                        print(f"❌ ORB strategy error: {e}")
+                        if DEBUG_MODE:
+                            import traceback
+                            traceback.print_exc()
 
                 # Opening-range reversal scan (STRATEGY=reversal/all), throttled
                 if ENABLE_REVERSAL_STRATEGY and scan_count % REVERSAL_SCAN_INTERVAL_SCANS == 0:
-                    run_reversal_strategy_scan(access_token, live_data, trader)
+                    try:
+                        run_reversal_strategy_scan(access_token, live_data, trader)
+                    except Exception as e:
+                        print(f"❌ run_reversal_strategy_scan error: {e}")
+                        if DEBUG_MODE:
+                            import traceback
+                            traceback.print_exc()
                 
                 # Update FII/DII if needed
                 if ENABLE_FII_DII_FILTER:
@@ -11794,46 +11813,104 @@ def enhanced_monitor(access_token, keys, symbols):
                     # ── S4: FII/DII BB-mid cross + live continuation ──────────
                     # Runs EVERY scan (not throttled) — immediate live-break
                     # detection is the whole point of this strategy.
+                    # Isolated in its own try/except: a failure here must NOT
+                    # prevent S1/S2/S3 or any strategy below from running.
                     if ENABLE_FII_BB_CONTINUATION:
-                        fii_bb_sigs = scan_fii_bb_continuation(access_token, live_data)
-                        for sig in fii_bb_sigs:
-                            _log_and_place_new_reversal(sig, trader, FII_BB_CSV, "FII/DII BB CONTINUATION")
+                        try:
+                            fii_bb_sigs = scan_fii_bb_continuation(access_token, live_data)
+                            if DEBUG_MODE:
+                                print(f"🔍 S4 (FII_BB_CONTINUATION): scanned, "
+                                      f"{len(FII_BB_ARMED)} armed, {len(fii_bb_sigs)} signal(s)")
+                            for sig in fii_bb_sigs:
+                                _log_and_place_new_reversal(sig, trader, FII_BB_CSV, "FII/DII BB CONTINUATION")
+                        except Exception as e:
+                            print(f"❌ S4 (FII_BB_CONTINUATION) error: {e}")
+                            if DEBUG_MODE:
+                                import traceback
+                                traceback.print_exc()
 
                     # ── New Reversal Strategies (throttled: every 2 scans) ────
+                    # Each strategy below is isolated in its own try/except so
+                    # a bug or data issue in one NEVER silently blocks another.
+                    # Previously all of S1-S4 (and everything else in this
+                    # scan) shared ONE outer try/except — an exception in an
+                    # earlier strategy (or ORB/gap/R3/box/range/fast trading)
+                    # would jump straight to "❌ Monitor loop error" and skip
+                    # every strategy after it for that entire scan cycle.
                     if scan_count % 2 == 0:
 
                         # S1: Big opening candle + resistance reversal
                         if ENABLE_RESISTANCE_REVERSAL:
-                            res_sigs = detect_resistance_reversal(access_token, live_data)
-                            for sig in res_sigs:
-                                _log_and_place_new_reversal(sig, trader, RES_REVERSAL_CSV, "RESISTANCE REVERSAL")
+                            try:
+                                res_sigs = detect_resistance_reversal(access_token, live_data)
+                                if DEBUG_MODE:
+                                    print(f"🔍 S1 (RESISTANCE_REVERSAL): scanned, {len(res_sigs)} signal(s)")
+                                for sig in res_sigs:
+                                    _log_and_place_new_reversal(sig, trader, RES_REVERSAL_CSV, "RESISTANCE REVERSAL")
+                            except Exception as e:
+                                print(f"❌ S1 (RESISTANCE_REVERSAL) error: {e}")
+                                if DEBUG_MODE:
+                                    import traceback
+                                    traceback.print_exc()
 
                         # S2: Dual-TF BB middle cross (5-min + 1-hr)
                         if ENABLE_DUAL_TF_BB:
-                            bb_sigs = detect_dual_tf_bb_cross(access_token, live_data)
-                            for sig in bb_sigs:
-                                _log_and_place_new_reversal(sig, trader, DUAL_TF_BB_CSV, "DUAL-TF BB")
+                            try:
+                                bb_sigs = detect_dual_tf_bb_cross(access_token, live_data)
+                                if DEBUG_MODE:
+                                    print(f"🔍 S2 (DUAL_TF_BB): scanned, {len(bb_sigs)} signal(s)")
+                                for sig in bb_sigs:
+                                    _log_and_place_new_reversal(sig, trader, DUAL_TF_BB_CSV, "DUAL-TF BB")
+                            except Exception as e:
+                                print(f"❌ S2 (DUAL_TF_BB) error: {e}")
+                                if DEBUG_MODE:
+                                    import traceback
+                                    traceback.print_exc()
 
                         # S3a: General universe — first-1H + weekly high/low breakout
                         if ENABLE_FIIDII_BREAKOUT:
-                            gen_sigs = detect_fiidii_confluence_breakout(
-                                access_token, live_data, mode='general')
-                            for sig in gen_sigs:
-                                _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "CONFLUENCE BREAKOUT")
+                            try:
+                                gen_sigs = detect_fiidii_confluence_breakout(
+                                    access_token, live_data, mode='general')
+                                if DEBUG_MODE:
+                                    print(f"🔍 S3a (FIIDII_GENERAL): scanned, {len(gen_sigs)} signal(s)")
+                                for sig in gen_sigs:
+                                    _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "CONFLUENCE BREAKOUT")
+                            except Exception as e:
+                                print(f"❌ S3a (FIIDII_GENERAL) error: {e}")
+                                if DEBUG_MODE:
+                                    import traceback
+                                    traceback.print_exc()
 
                         # S3b: FII/DII universe — same + 2-wk lookback + BB middle + 2-candle confirm
                         if ENABLE_FIIDII_BREAKOUT:
-                            fii_sigs = detect_fiidii_confluence_breakout(
-                                access_token, live_data, mode='fii')
-                            for sig in fii_sigs:
-                                _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "FII/DII CONFLUENCE")
+                            try:
+                                fii_sigs = detect_fiidii_confluence_breakout(
+                                    access_token, live_data, mode='fii')
+                                if DEBUG_MODE:
+                                    print(f"🔍 S3b (FIIDII_FII): scanned, {len(fii_sigs)} signal(s)")
+                                for sig in fii_sigs:
+                                    _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "FII/DII CONFLUENCE")
+                            except Exception as e:
+                                print(f"❌ S3b (FIIDII_FII) error: {e}")
+                                if DEBUG_MODE:
+                                    import traceback
+                                    traceback.print_exc()
 
                         # S3c: FII/DII rolling-anchor + strong-close variant
                         if ENABLE_FIIDII_BREAKOUT_V2:
-                            fii_v2_sigs = detect_fiidii_confluence_breakout(
-                                access_token, live_data, mode='fii_v2')
-                            for sig in fii_v2_sigs:
-                                _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "FII/DII BB-CROSS V2")
+                            try:
+                                fii_v2_sigs = detect_fiidii_confluence_breakout(
+                                    access_token, live_data, mode='fii_v2')
+                                if DEBUG_MODE:
+                                    print(f"🔍 S3c (FIIDII_FII_V2): scanned, {len(fii_v2_sigs)} signal(s)")
+                                for sig in fii_v2_sigs:
+                                    _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "FII/DII BB-CROSS V2")
+                            except Exception as e:
+                                print(f"❌ S3c (FIIDII_FII_V2) error: {e}")
+                                if DEBUG_MODE:
+                                    import traceback
+                                    traceback.print_exc()
 
                     for key, live in live_data.items():
                         if key in R3_LEVELS:
