@@ -616,6 +616,30 @@ FII_DII_TREND_LOCK                = threading.RLock()  # Thread safety
 ORB_CANDLES = {}
 ORB_SIGNALS = {}
 ORB_LATE_CHECKED = set()   # symbols confirmed zero-volume at 09:20; retry until volume appears
+
+# ========== ORB-15: SEPARATE 15-MINUTE OPENING RANGE STRATEGY ==========
+# Fully independent from the existing 5-min ORB above — different opening
+# range window (09:15-09:30 instead of 09:15-09:20), different (looser)
+# volume threshold (1.2x vs 1.5x), own signal store, own alert tracking,
+# own CSV logs. Runs in parallel so both can be compared side by side.
+ENABLE_ORB_15                   = True
+ORB_15_TIMEFRAME_MINUTES        = 15      # First 15 minutes (09:15-09:30)
+ORB_15_SNAPSHOT_TIME             = "09:30"  # when the opening range "closes"
+ORB_15_VOLUME_CONFIRMATION      = 1.2     # looser than 5-min ORB's 1.5x
+ORB_15_BREAKOUT_WINDOW_MINUTES  = 45      # trade within 45 min of 09:30 close (until ~10:15)
+ORB_15_MIN_VOLUME               = 500000  # same liquidity floor as 5-min ORB
+ORB_15_MAX_ORDERS               = 5
+
+ORB_15_SIGNALS: dict = {}          # symbol -> orb signal dict (built at 09:30)
+ORB_15_ALERTED_STOCKS: set = set() # symbols that already fired a breakout today
+ORB_15_LATE_CHECKED: set = set()   # zero-volume retry set (mirrors ORB_LATE_CHECKED)
+ORB_15_PROCESSED_TODAY = False
+ORB_15_ORDER_COUNT = 0
+
+ORB_15_SIGNALS_FILE = "orb_15_signals.csv"
+ORB_15_TRADES_FILE  = "orb_15_trades.csv"
+ORB_15_LOG_FILE     = "orb_15_trading_log.txt"
+
 ORB_ACTIVE_TRADES = {}
 ORB_ALERTED_STOCKS = set()   # fired ORB signal today
 ORB_ORDER_COUNT = 0
@@ -4002,6 +4026,293 @@ def send_orb_reversal_alert(signal, trader=None):
         print(f"⚠️ ORB order limit reached ({ORB_ORDER_COUNT}/{MAX_ORDERS_PER_DAY}) — reversal signal logged only")
 
 
+def process_first_15min_candles(access_token, live_data, late_pass=False):
+    """Build ORB-15 signals from the first 15-minute opening range (09:15-09:30).
+
+    Mirrors process_first_candles() exactly, but snapshots live OHLC at
+    ORB_15_SNAPSHOT_TIME (09:30) instead of 09:20, and reuses the SAME
+    calculate_orb_levels() function (which is timeframe-agnostic) — only the
+    volume threshold differs at the breakout-check stage (1.2x vs 1.5x).
+    """
+    global ORB_15_SIGNALS, ORB_15_PROCESSED_TODAY, ORB_15_LATE_CHECKED
+    if not late_pass:
+        print(f"\n{'='*100}")
+        print("📊 PROCESSING FIRST 15-MINUTE CANDLES FOR ORB-15 STRATEGY")
+        print(f"{'='*100}\n")
+        ORB_15_LATE_CHECKED.clear()
+    else:
+        if not ORB_15_LATE_CHECKED:
+            return
+        print(f"\n🔄 ORB-15 late-volume pass ({now_ist().strftime('%H:%M')}) — "
+              f"retrying {len(ORB_15_LATE_CHECKED)} zero-volume symbols from 09:30")
+
+    orb15_count = 0
+    very_high = 0
+    high = 0
+
+    candidates = (
+        {sk: live_data[sk] for sk in list(ORB_15_LATE_CHECKED) if sk in live_data}
+        if late_pass else live_data
+    )
+
+    for symbol_key, data in candidates.items():
+        try:
+            symbol = ISIN_TO_SYMBOL.get(symbol_key, symbol_key)
+            ltp    = data.get('ltp', 0)
+            volume = data.get('volume', 0)
+
+            if volume == 0:
+                if not late_pass:
+                    ORB_15_LATE_CHECKED.add(symbol_key)
+                continue
+
+            ORB_15_LATE_CHECKED.discard(symbol_key)
+
+            open_price  = data.get('open', ltp)
+            close_price = ltp
+            high_price  = data.get('high', ltp)
+            low_price   = data.get('low', ltp)
+
+            candle_df  = get_realtime_5min_df(symbol, min_bars=15)
+            orb15_signal = calculate_orb_levels(
+                symbol, open_price, close_price, high_price, low_price, volume,
+                candle_df=candle_df, instrument_key=symbol_key
+            )
+            if orb15_signal:
+                ORB_15_SIGNALS[symbol] = orb15_signal
+                orb15_count += 1
+                if orb15_signal['confidence'] == 'VERY_HIGH':
+                    very_high += 1
+                elif orb15_signal['confidence'] == 'HIGH':
+                    high += 1
+                log_orb_15_signal(orb15_signal)
+                if orb15_signal['confidence'] in ['VERY_HIGH', 'HIGH']:
+                    rsi_str = f"RSI={orb15_signal['rsi_at_signal']:.1f}" if orb15_signal['rsi_at_signal'] else "RSI=N/A"
+                    ko      = orb15_signal['klinger_at_signal']
+                    ko_str  = f"KO={ko/1e6:.1f}M" if ko is not None else "KO=N/A"
+                    tag     = " [LATE]" if late_pass else ""
+                    print(f"✅{tag} [ORB-15] {symbol:12} | {orb15_signal['signal_type']:15} | "
+                          f"{orb15_signal['confidence']:10} | FII: {orb15_signal['fii_dii_signal']:12} | "
+                          f"R:R {orb15_signal['risk_reward']:.2f}:1 | {rsi_str} | {ko_str}")
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"ORB-15 Error {symbol_key}: {e}")
+
+    ORB_15_PROCESSED_TODAY = True
+    if orb15_count > 0 or not late_pass:
+        print(f"\n✅ [ORB-15] {'Late pass:' if late_pass else 'Processed'} {orb15_count} signals"
+              f"{'' if late_pass else f' | VERY HIGH: {very_high} | HIGH: {high}'}")
+    if not late_pass:
+        print(f"{'='*100}\n")
+
+
+def check_orb_15_breakout(symbol, current_price, current_volume, live_data, access_token=''):
+    """Same logic as check_orb_breakout(), but keyed to ORB_15_SIGNALS, its
+    own snapshot time (09:30), its own breakout window, and the looser
+    1.2x volume confirmation.
+    """
+    if symbol not in ORB_15_SIGNALS or symbol in ORB_15_ALERTED_STOCKS:
+        return None
+    orb = ORB_15_SIGNALS[symbol]
+    now = now_ist()
+    snap_hh, snap_mm = map(int, ORB_15_SNAPSHOT_TIME.split(':'))
+    market_open_930 = now.replace(hour=snap_hh, minute=snap_mm, second=0, microsecond=0)
+    minutes_since_930 = (now - market_open_930).total_seconds() / 60
+    if minutes_since_930 < 0 or minutes_since_930 > ORB_15_BREAKOUT_WINDOW_MINUTES:
+        return None
+
+    ikey = orb.get('instrument_key') or SYMBOL_TO_ISIN.get(symbol, '')
+    rvol, _, _ = compute_intraday_rvol(symbol, access_token, ikey)
+    volume_ratio = rvol if rvol is not None else 0.0
+    if rvol is not None and rvol < ORB_15_VOLUME_CONFIRMATION:
+        if DEBUG_MODE:
+            print(f"⛔ ORB-15 breakout: {symbol} RVOL {rvol:.2f}x < {ORB_15_VOLUME_CONFIRMATION}x")
+        return None
+
+    if ORB_ENABLE_RSI_GATE:
+        try:
+            df = get_realtime_5min_df(symbol, min_bars=15)
+            if df is not None and len(df) >= 15:
+                live_rsi = calculate_rsi(df, period=14)
+                if live_rsi is not None:
+                    if orb['is_bullish'] and live_rsi < ORB_RSI_LONG_MIN:
+                        if orb['confidence'] != 'VERY_HIGH':
+                            if DEBUG_MODE:
+                                print(f"⛔ ORB-15 breakout RSI gate: {symbol} LONG "
+                                      f"(RSI={live_rsi:.1f} < {ORB_RSI_LONG_MIN})")
+                            return None
+                    elif not orb['is_bullish'] and live_rsi > ORB_RSI_SHORT_MAX:
+                        if orb['confidence'] != 'VERY_HIGH':
+                            if DEBUG_MODE:
+                                print(f"⛔ ORB-15 breakout RSI gate: {symbol} SHORT "
+                                      f"(RSI={live_rsi:.1f} > {ORB_RSI_SHORT_MAX})")
+                            return None
+        except Exception:
+            pass
+
+    breakout_signal = None
+    if orb['is_bullish'] and current_price > orb['breakout_level'] * 1.001:
+        breakout_signal = {
+            'symbol': symbol, 'signal': 'ORB_15_BREAKOUT', 'direction': 'BUY',
+            'entry_price': current_price, 'stop_loss': orb['stop_level'],
+            'target': orb['target_level'], 'orb_data': orb,
+            'volume_ratio': volume_ratio, 'confidence': orb['confidence'],
+            'fii_dii_signal': orb['fii_dii_signal'], 'risk': orb['risk'],
+            'reward': orb['reward'], 'risk_reward': orb['risk_reward'],
+            'entry_type': ENTRY_ORB_BULLISH,
+        }
+    elif not orb['is_bullish'] and current_price < orb['breakout_level'] * 0.999:
+        breakout_signal = {
+            'symbol': symbol, 'signal': 'ORB_15_BREAKDOWN', 'direction': 'SELL',
+            'entry_price': current_price, 'stop_loss': orb['stop_level'],
+            'target': orb['target_level'], 'orb_data': orb,
+            'volume_ratio': volume_ratio, 'confidence': orb['confidence'],
+            'fii_dii_signal': orb['fii_dii_signal'], 'risk': orb['risk'],
+            'reward': orb['reward'], 'risk_reward': orb['risk_reward'],
+            'entry_type': ENTRY_ORB_BEARISH,
+        }
+    return breakout_signal
+
+
+def log_orb_15_signal(signal):
+    try:
+        with open(ORB_15_SIGNALS_FILE, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                now_ist().strftime('%Y-%m-%d %H:%M:%S'),
+                signal['symbol'], signal['signal_type'], signal['direction'],
+                f"{signal['breakout_level']:.2f}", f"{signal['stop_level']:.2f}",
+                f"{signal['target_level']:.2f}", f"{signal['body_percent']:.2f}",
+                f"{signal['risk_reward']:.2f}", signal['fii_dii_signal'],
+                signal['confidence']
+            ])
+    except Exception:
+        pass
+
+
+def log_orb_15_trade(trade, action='ENTRY'):
+    try:
+        with open(ORB_15_TRADES_FILE, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                now_ist().strftime('%Y-%m-%d %H:%M:%S'),
+                trade['symbol'], action, trade['direction'],
+                f"{trade['entry_price']:.2f}", f"{trade['stop_loss']:.2f}",
+                f"{trade['target']:.2f}", f"{trade.get('volume_ratio', 0):.2f}",
+                trade['confidence'], trade['fii_dii_signal']
+            ])
+    except Exception:
+        pass
+
+
+def send_orb_15_alert(signal, trader=None):
+    """Mirrors send_orb_alert() — own alerted-set, own order counter, own
+    CSV/log files, own max-orders cap. Fully independent of the 5-min ORB.
+    """
+    global ORB_15_ALERTED_STOCKS, ORB_15_ORDER_COUNT
+    ORB_15_ALERTED_STOCKS.add(signal['symbol'])
+    print("\n" + "="*100)
+    print(f"⚡ ORB-15 SIGNAL: {signal['symbol']} ⚡")
+    print("="*100)
+    print(f"Signal:       {signal['signal']}")
+    print(f"Direction:    {signal['direction']}")
+    print(f"Confidence:   {signal['confidence']}")
+    print(f"FII/DII:      {signal['fii_dii_signal']}")
+    print(f"Entry Price:  ₹{signal['entry_price']:.2f}")
+    print(f"Stop Loss:    ₹{signal['stop_loss']:.2f}")
+    print(f"Target:       ₹{signal['target']:.2f}")
+    print(f"R:R Ratio:    {signal['risk_reward']:.2f}:1")
+    print(f"Volume:       {signal['volume_ratio']:.2f}x average (ORB-15 threshold: {ORB_15_VOLUME_CONFIRMATION}x)")
+    print("="*100)
+    log_orb_15_trade(signal, 'ENTRY')
+    try:
+        with open(ORB_15_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*100}\n")
+            f.write(f"ORB-15 ALERT: {now_ist().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Symbol: {signal['symbol']}\n")
+            f.write(f"Signal: {signal['signal']} ({signal['direction']})\n")
+            f.write(f"Confidence: {signal['confidence']} | FII/DII: {signal['fii_dii_signal']}\n")
+            f.write(f"Entry: ₹{signal['entry_price']:.2f} | Stop: ₹{signal['stop_loss']:.2f} | Target: ₹{signal['target']:.2f}\n")
+            f.write(f"R:R: {signal['risk_reward']:.2f}:1 | Volume: {signal['volume_ratio']:.2f}x\n")
+            f.write(f"{'='*100}\n")
+    except Exception:
+        pass
+
+    if ENABLE_AUTO_TRADING and trader and ORB_15_ORDER_COUNT < ORB_15_MAX_ORDERS:
+        if not is_order_time_allowed():
+            print(f"⏭️  ORB-15 {signal['symbol']}: order skipped — outside Upstox service hours")
+            return
+        print(f"\n📤 Placing ORB-15 {signal['direction']} order for {signal['symbol']}...")
+        orb15_breakout = {
+            'symbol':        signal['symbol'],
+            'instrument_key': signal.get('instrument_key', signal.get('orb_data', {}).get('instrument_key', '')),
+            'breakout_type': 'CE' if signal['direction'] == 'BUY' else 'PE',
+            'strategy':      'ORB_15',
+            'entry_price':   signal['entry_price'],
+            'stop_loss':     signal['stop_loss'],
+            'target':        signal['target'],
+            'klinger_status': signal.get('orb_data', {}).get('klinger_at_signal'),
+        }
+        order_id = place_breakout_order(orb15_breakout, trader)
+        if order_id:
+            ORB_15_ORDER_COUNT += 1
+            print(f"✅ ORB-15 order placed: {order_id} | ORB-15 orders today: {ORB_15_ORDER_COUNT}/{ORB_15_MAX_ORDERS}")
+        else:
+            print(f"⚠️ ORB-15 order failed for {signal['symbol']}")
+    elif ORB_15_ORDER_COUNT >= ORB_15_MAX_ORDERS:
+        print(f"⚠️ ORB-15 order limit reached ({ORB_15_ORDER_COUNT}/{ORB_15_MAX_ORDERS}) — signal logged only")
+
+
+def check_orb_15_time_and_process(access_token, live_data):
+    """Time-trigger for ORB-15, mirroring check_orb_time_and_process() but
+    anchored to ORB_15_SNAPSHOT_TIME (09:30) instead of 09:20.
+    """
+    global ORB_15_PROCESSED_TODAY, ORB_15_LATE_CHECKED
+    if not ENABLE_ORB_15:
+        return
+    now          = now_ist()
+    current_time = now.strftime("%H:%M")
+    snap_hh, snap_mm = map(int, ORB_15_SNAPSHOT_TIME.split(':'))
+    market_930   = now.replace(hour=snap_hh, minute=snap_mm, second=0, microsecond=0)
+    cutoff       = market_930 + timedelta(minutes=ORB_15_BREAKOUT_WINDOW_MINUTES)
+
+    if current_time >= ORB_15_SNAPSHOT_TIME and now < cutoff and not ORB_15_PROCESSED_TODAY:
+        if current_time >= "09:35":
+            print(f"\n⚠️  ORB-15: Late start detected ({current_time}). "
+                  f"Running primary ORB-15 pass now.")
+        process_first_15min_candles(access_token, live_data, late_pass=False)
+
+    elif (ORB_15_PROCESSED_TODAY
+          and ORB_15_LATE_CHECKED
+          and current_time >= "09:35"
+          and now < cutoff):
+        process_first_15min_candles(access_token, live_data, late_pass=True)
+
+
+def monitor_orb_15_breakouts(live_data, access_token='', trader=None):
+    """Mirrors monitor_orb_breakouts() — scans ORB_15_SIGNALS for breakouts
+    on every live_data tick. No reversal logic in this first pass (breakout
+    signal only, per the current scope).
+    """
+    if not ENABLE_ORB_15 or not ORB_15_SIGNALS:
+        return
+    for symbol_key, data in live_data.items():
+        try:
+            symbol = ISIN_TO_SYMBOL.get(symbol_key, symbol_key)
+            if symbol not in ORB_15_SIGNALS:
+                continue
+            ltp    = data.get('ltp', 0)
+            volume = data.get('volume', 0)
+            if ltp == 0:
+                continue
+            breakout = check_orb_15_breakout(symbol, ltp, volume, data, access_token)
+            if breakout:
+                send_orb_15_alert(breakout, trader)
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"ORB-15 monitor error {symbol_key}: {e}")
+
+
 def initialize_orb_csv_files():
     """Create ORB signal and trade CSV files with headers if they don't exist."""
     csv_files = [
@@ -4009,7 +4320,12 @@ def initialize_orb_csv_files():
                             'Breakout_Level', 'Stop_Level', 'Target_Level',
                             'Body_Percent', 'Risk_Reward', 'FII_DII_Signal', 'Confidence']),
         (ORB_TRADES_FILE,  ['Timestamp', 'Symbol', 'Action', 'Direction', 'Price',
-                            'Stop_Loss', 'Target', 'Volume_Ratio', 'Confidence', 'FII_DII_Signal'])
+                            'Stop_Loss', 'Target', 'Volume_Ratio', 'Confidence', 'FII_DII_Signal']),
+        (ORB_15_SIGNALS_FILE, ['Timestamp', 'Symbol', 'Signal_Type', 'Direction',
+                            'Breakout_Level', 'Stop_Level', 'Target_Level',
+                            'Body_Percent', 'Risk_Reward', 'FII_DII_Signal', 'Confidence']),
+        (ORB_15_TRADES_FILE,  ['Timestamp', 'Symbol', 'Action', 'Direction', 'Price',
+                            'Stop_Loss', 'Target', 'Volume_Ratio', 'Confidence', 'FII_DII_Signal']),
     ]
     for csv_file, headers in csv_files:
         if not os.path.exists(csv_file):
@@ -4061,6 +4377,12 @@ def check_orb_time_and_process(access_token, live_data):
         FIIDII_BRK_ALERTED.clear()
         FII_BB_ALERTED_TODAY.clear()   # daily reset — but FII_BB_ARMED persists
                                        # across days by design (continuous 2-3 day watch)
+        global ORB_15_PROCESSED_TODAY, ORB_15_ORDER_COUNT
+        ORB_15_SIGNALS.clear()
+        ORB_15_ALERTED_STOCKS.clear()
+        ORB_15_LATE_CHECKED.clear()
+        ORB_15_PROCESSED_TODAY = False
+        ORB_15_ORDER_COUNT = 0
 
     # ── PRIMARY PASS ─────────────────────────────────────────────────────────
     # Old: only ran 09:20-09:25. Bot starting at 09:26 silently skipped ORB.
@@ -11719,6 +12041,20 @@ def enhanced_monitor(access_token, keys, symbols):
                         monitor_orb_breakouts(live_data, access_token, trader)
                     except Exception as e:
                         print(f"❌ ORB strategy error: {e}")
+                        if DEBUG_MODE:
+                            import traceback
+                            traceback.print_exc()
+
+                # ORB-15: separate 15-min opening range, 1.2x volume — isolated
+                if ENABLE_ORB_15:
+                    try:
+                        check_orb_15_time_and_process(access_token, live_data)
+                        monitor_orb_15_breakouts(live_data, access_token, trader)
+                        if DEBUG_MODE:
+                            print(f"🔍 ORB-15: {len(ORB_15_SIGNALS)} signals tracked, "
+                                  f"{len(ORB_15_ALERTED_STOCKS)} alerted today")
+                    except Exception as e:
+                        print(f"❌ ORB-15 strategy error: {e}")
                         if DEBUG_MODE:
                             import traceback
                             traceback.print_exc()
