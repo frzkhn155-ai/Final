@@ -467,6 +467,15 @@ FIIDII_BRK_VOLUME_MIN           = 1.8      # volume spike threshold
 FIIDII_BRK_NOISE_MIN_BODY_PCT   = 0.35     # ignore small reversal candles
 FIIDII_BRK_2CANDLE_CONFIRM      = True     # require TWO consecutive closes above level
 FIIDII_BRK_MAX_ORDERS           = 5
+
+# ── Extensions: buffer, configurable timeframe, 1H-already-broken fallback ──
+FIIDII_BRK_BUFFER_PCT           = 0.15     # require close beyond level by this % (fewer false breakouts)
+FIIDII_BRK_CONFIRM_TF           = '5min'   # '5min' | '15min' | '1h' — confirmation candle timeframe
+FIIDII_BRK_ALLOW_1H_FALLBACK    = True     # if the 1H candle itself already broke the level,
+                                           # accept the first confirming lower-TF candle after it
+                                           # instead of waiting for a brand-new full 1H close
+VERBOSE_STRATEGY_HEARTBEAT      = False    # False: suppress "scanned, 0 signals" heartbeat noise;
+                                           # only print actual signals/orders + rejection reasons
 FIIDII_BRK_ALERTED              = set()    # (symbol, mode) tuples fired today
 
 # CSV log files for new strategies
@@ -11573,6 +11582,20 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii',
 
     'If price reverses with small candles or small price changes → ignore
     and continue waiting.' — implemented via the noise gate (both styles).
+
+    Extensions (apply to all modes/styles):
+      FIIDII_BRK_BUFFER_PCT: require the confirmation candle's close to clear
+        the level by this % (default 0.15%) — reduces false breakouts from
+        price just touching the level.
+      FIIDII_BRK_CONFIRM_TF: '5min' | '15min' | '1h' — which candle timeframe
+        confirms the breakout. 5min = earliest signals, more trades. 1h =
+        most confirmation, fewer trades.
+      FIIDII_BRK_ALLOW_1H_FALLBACK: if the 1H candle itself already closed
+        beyond the level (so waiting for a full NEW 1H candle would be too
+        late), fall back to the first confirming 15-min candle instead.
+      VERBOSE_STRATEGY_HEARTBEAT: when False, suppresses the routine
+        per-scan "scanned, 0 signals" print — only real signals, orders,
+        and ⛔ rejection reasons are shown.
     """
     global FIIDII_BRK_ALERTED
     if not ENABLE_FIIDII_BREAKOUT:
@@ -11643,11 +11666,40 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii',
             if weekly_res is None:
                 continue
 
-            # ── 5-min 2-candle confirmation ──────────────────────────────────
-            prev5 = df5.iloc[-3]   # second-to-last completed 5-min bar
-            last5 = df5.iloc[-2]   # last completed 5-min bar
+            # ── Confirmation candle: configurable timeframe ───────────────────
+            # FIIDII_BRK_CONFIRM_TF selects which candle confirms the breakout.
+            # If the 1H candle ALREADY closed beyond the level (so waiting for
+            # a brand-new full 1H bar would be too late), and the fallback is
+            # enabled, drop down to 15-min confirmation for this scan.
+            confirm_tf = FIIDII_BRK_CONFIRM_TF
+            if FIIDII_BRK_ALLOW_1H_FALLBACK and confirm_tf == '1h':
+                cand_high = max(anchor_high, weekly_res)
+                cand_low  = min(anchor_low, weekly_sup)
+                h1_already_broke = (last_1h['close'] > cand_high or
+                                     last_1h['close'] < cand_low)
+                if h1_already_broke:
+                    confirm_tf = '15min'
+                    if DEBUG_MODE:
+                        print(f"ℹ️ fiidii_brk {symbol}({mode}): 1H already broke level — "
+                              f"falling back to 15min confirmation")
 
-            avg_vol   = df5['volume'].tail(20).mean() or 1
+            if confirm_tf == '1h':
+                conf_df = df1h
+            elif confirm_tf == '15min':
+                conf_df = df[['open', 'high', 'low', 'close', 'volume']].resample('15min').agg(
+                    {'open': 'first', 'high': 'max', 'low': 'min',
+                     'close': 'last', 'volume': 'sum'}
+                ).dropna().reset_index()
+            else:  # '5min'
+                conf_df = df5
+
+            if len(conf_df) < 3:
+                continue
+
+            prev5 = conf_df.iloc[-3]   # second-to-last completed confirmation-TF bar
+            last5 = conf_df.iloc[-2]   # last completed confirmation-TF bar
+
+            avg_vol   = conf_df['volume'].tail(20).mean() or 1
             vol_ratio = last5['volume'] / avg_vol
 
             # Noise gate: ignore tiny candles
@@ -11688,16 +11740,17 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii',
 
             # ── LONG (CE): break above anchor-high AND weekly-body-high ──────
             long_level = max(anchor_high, weekly_res)
+            long_level_buffered = long_level * (1 + FIIDII_BRK_BUFFER_PCT / 100)
 
             if confirm_style == 'two_candle':
                 # "Previous candle AND new candle break" = 2-candle SAME-LEVEL close
-                confirm_bull = (prev5['close'] > long_level and
-                                last5['close'] > long_level)
+                confirm_bull = (prev5['close'] > long_level_buffered and
+                                last5['close'] > long_level_buffered)
             else:  # 'prev_candle_break'
-                # Current candle closes beyond the weekly level, AND its high
-                # also breaks the PREVIOUS candle's high (not the weekly level
+                # Current candle closes beyond the weekly level (+ buffer), AND its
+                # high also breaks the PREVIOUS candle's high (not the weekly level
                 # a second time) — looser, single-level confirmation.
-                confirm_bull = (last5['close'] > long_level and
+                confirm_bull = (last5['close'] > long_level_buffered and
                                 last5['high'] > prev5['high'])
 
             fii_bull_ok = mode not in ('fii', 'fii_v2') or fii_sig in ('STRONG_BUY', 'BUY')
@@ -11713,25 +11766,25 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii',
                     'signal': f'FIIDII_BRK_LONG_{mode.upper()}',
                     'direction': 'CE',
                     'entry': ltp, 'stop': stop, 'target': target,
-                    'level': long_level,
+                    'level': long_level, 'level_buffered': long_level_buffered,
                     'anchor_high': anchor_high, 'weekly_res': weekly_res,
-                    'confirm_style': confirm_style,
+                    'confirm_style': confirm_style, 'confirm_tf': confirm_tf,
                     'vol_ratio': round(vol_ratio, 2),
                     'fii_dii': fii_sig, 'confidence': confidence,
                     'timestamp': now_ist(),
                 })
-                if DEBUG_MODE:
-                    print(f"🟢 FIIDII_BRK CE [{mode}/{confirm_style}]: {symbol} | level ₹{long_level:.2f} | vol {vol_ratio:.2f}x")
+                print(f"🟢 FIIDII_BRK CE [{mode}/{confirm_style}/{confirm_tf}]: {symbol} | level ₹{long_level:.2f} (buffered ₹{long_level_buffered:.2f}) | vol {vol_ratio:.2f}x")
                 continue
 
             # ── SHORT (PE): break below anchor-low AND weekly-body-low ───────
             short_level = min(anchor_low, weekly_sup)
+            short_level_buffered = short_level * (1 - FIIDII_BRK_BUFFER_PCT / 100)
 
             if confirm_style == 'two_candle':
-                confirm_bear = (prev5['close'] < short_level and
-                                last5['close'] < short_level)
+                confirm_bear = (prev5['close'] < short_level_buffered and
+                                last5['close'] < short_level_buffered)
             else:  # 'prev_candle_break'
-                confirm_bear = (last5['close'] < short_level and
+                confirm_bear = (last5['close'] < short_level_buffered and
                                 last5['low'] < prev5['low'])
 
             fii_bear_ok = mode not in ('fii', 'fii_v2') or fii_sig in ('STRONG_SELL', 'SELL')
@@ -11747,15 +11800,14 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii',
                     'signal': f'FIIDII_BRK_SHORT_{mode.upper()}',
                     'direction': 'PE',
                     'entry': ltp, 'stop': stop, 'target': target,
-                    'level': short_level,
+                    'level': short_level, 'level_buffered': short_level_buffered,
                     'anchor_low': anchor_low, 'weekly_sup': weekly_sup,
-                    'confirm_style': confirm_style,
+                    'confirm_style': confirm_style, 'confirm_tf': confirm_tf,
                     'vol_ratio': round(vol_ratio, 2),
                     'fii_dii': fii_sig, 'confidence': confidence,
                     'timestamp': now_ist(),
                 })
-                if DEBUG_MODE:
-                    print(f"🔴 FIIDII_BRK PE [{mode}/{confirm_style}]: {symbol} | level ₹{short_level:.2f} | vol {vol_ratio:.2f}x")
+                print(f"🔴 FIIDII_BRK PE [{mode}/{confirm_style}/{confirm_tf}]: {symbol} | level ₹{short_level:.2f} (buffered ₹{short_level_buffered:.2f}) | vol {vol_ratio:.2f}x")
 
         except Exception as e:
             if DEBUG_MODE:
@@ -12317,7 +12369,7 @@ def enhanced_monitor(access_token, keys, symbols):
                     try:
                         check_orb_15_time_and_process(access_token, live_data)
                         monitor_orb_15_breakouts(live_data, access_token, trader)
-                        if DEBUG_MODE:
+                        if DEBUG_MODE and VERBOSE_STRATEGY_HEARTBEAT:
                             print(f"🔍 ORB-15: {len(ORB_15_SIGNALS)} signals tracked, "
                                   f"{len(ORB_15_ALERTED_STOCKS)} breakout-alerted, "
                                   f"{len(ORB_15_REVERSAL_ALERTED)} reversal-alerted today")
@@ -12422,7 +12474,7 @@ def enhanced_monitor(access_token, keys, symbols):
                     if ENABLE_FII_BB_CONTINUATION:
                         try:
                             fii_bb_sigs = scan_fii_bb_continuation(access_token, live_data)
-                            if DEBUG_MODE:
+                            if DEBUG_MODE and VERBOSE_STRATEGY_HEARTBEAT:
                                 print(f"🔍 S4 (FII_BB_CONTINUATION): scanned, "
                                       f"{len(FII_BB_ARMED)} armed, {len(fii_bb_sigs)} signal(s)")
                             for sig in fii_bb_sigs:
@@ -12447,7 +12499,7 @@ def enhanced_monitor(access_token, keys, symbols):
                         if ENABLE_RESISTANCE_REVERSAL:
                             try:
                                 res_sigs = detect_resistance_reversal(access_token, live_data)
-                                if DEBUG_MODE:
+                                if DEBUG_MODE and VERBOSE_STRATEGY_HEARTBEAT:
                                     print(f"🔍 S1 (RESISTANCE_REVERSAL): scanned, {len(res_sigs)} signal(s)")
                                 for sig in res_sigs:
                                     _log_and_place_new_reversal(sig, trader, RES_REVERSAL_CSV, "RESISTANCE REVERSAL")
@@ -12461,7 +12513,7 @@ def enhanced_monitor(access_token, keys, symbols):
                         if ENABLE_DUAL_TF_BB:
                             try:
                                 bb_sigs = detect_dual_tf_bb_cross(access_token, live_data)
-                                if DEBUG_MODE:
+                                if DEBUG_MODE and VERBOSE_STRATEGY_HEARTBEAT:
                                     print(f"🔍 S2 (DUAL_TF_BB): scanned, {len(bb_sigs)} signal(s)")
                                 for sig in bb_sigs:
                                     _log_and_place_new_reversal(sig, trader, DUAL_TF_BB_CSV, "DUAL-TF BB")
@@ -12476,7 +12528,7 @@ def enhanced_monitor(access_token, keys, symbols):
                             try:
                                 gen_sigs = detect_fiidii_confluence_breakout(
                                     access_token, live_data, mode='general')
-                                if DEBUG_MODE:
+                                if DEBUG_MODE and VERBOSE_STRATEGY_HEARTBEAT:
                                     print(f"🔍 S3a (FIIDII_GENERAL): scanned, {len(gen_sigs)} signal(s)")
                                 for sig in gen_sigs:
                                     _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "CONFLUENCE BREAKOUT")
@@ -12491,7 +12543,7 @@ def enhanced_monitor(access_token, keys, symbols):
                             try:
                                 fii_sigs = detect_fiidii_confluence_breakout(
                                     access_token, live_data, mode='fii')
-                                if DEBUG_MODE:
+                                if DEBUG_MODE and VERBOSE_STRATEGY_HEARTBEAT:
                                     print(f"🔍 S3b (FIIDII_FII): scanned, {len(fii_sigs)} signal(s)")
                                 for sig in fii_sigs:
                                     _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "FII/DII CONFLUENCE")
@@ -12506,7 +12558,7 @@ def enhanced_monitor(access_token, keys, symbols):
                             try:
                                 fii_v2_sigs = detect_fiidii_confluence_breakout(
                                     access_token, live_data, mode='fii_v2')
-                                if DEBUG_MODE:
+                                if DEBUG_MODE and VERBOSE_STRATEGY_HEARTBEAT:
                                     print(f"🔍 S3c (FIIDII_FII_V2): scanned, {len(fii_v2_sigs)} signal(s)")
                                 for sig in fii_v2_sigs:
                                     _log_and_place_new_reversal(sig, trader, FIIDII_BREAKOUT_CSV, "FII/DII BB-CROSS V2")
