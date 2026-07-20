@@ -170,7 +170,7 @@ jobs:
         run: |
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
-          python - <<'PYEOF'
+          python -u - <<'PYEOF' 2>&1 | tee console_output.log
           import traceback, sys, runpy
           try:
               runpy.run_path("Both4withcache10_headless.py", run_name="__main__")
@@ -189,7 +189,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          for f in orb_signals.csv orb_trades.csv orb_trading_log.txt r3_live_alerts.csv r3_live_alerts.txt gap_trading_alerts.csv gap_trading_alerts.txt box_trading_alerts.csv box_trading_alerts.txt range_trading_alerts.csv range_trading_alerts.txt exits_log.csv exits_log.txt positions_tracking.csv fast_trades_entries.csv fast_trades_exits.csv fii_dii_cache.json fii_dii_trend_cache.json crash_log.txt reversal_signals.csv resistance_reversal_alerts.csv dual_tf_bb_alerts.csv fiidii_breakout_alerts.csv fii_bb_continuation_alerts.csv box_midday_alerts.csv afternoon_pivot_alerts.csv; do
+          for f in orb_signals.csv orb_trades.csv orb_trading_log.txt r3_live_alerts.csv r3_live_alerts.txt gap_trading_alerts.csv gap_trading_alerts.txt box_trading_alerts.csv box_trading_alerts.txt range_trading_alerts.csv range_trading_alerts.txt exits_log.csv exits_log.txt positions_tracking.csv fast_trades_entries.csv fast_trades_exits.csv fii_dii_cache.json fii_dii_trend_cache.json crash_log.txt reversal_signals.csv resistance_reversal_alerts.csv dual_tf_bb_alerts.csv fiidii_breakout_alerts.csv fii_bb_continuation_alerts.csv box_midday_alerts.csv afternoon_pivot_alerts.csv orb_15_signals.csv orb_15_trades.csv orb_15_trading_log.txt console_output.log; do
             [ -f "$f" ] && git add -f "$f"
           done
           git add -f FII_DII_*.csv 2>/dev/null || true
