@@ -1,0 +1,3 @@
+Timestamp,Symbol,Signal_Type,Direction,Breakout_Level,Stop_Level,Target_Level,Body_Percent,Risk_Reward,FII_DII_Signal,Confidence
+2026-07-21 09:30:24,NAUKRI,BULLISH_ORB,BUY,1214.35,1193.95,1255.05,1.70,2.00,BUY,HIGH
+2026-07-21 09:30:24,IDFCFIRSTB,BULLISH_ORB,BUY,82.60,81.60,84.24,1.00,1.64,STRONG_BUY,VERY_HIGH
