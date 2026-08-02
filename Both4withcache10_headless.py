@@ -502,6 +502,40 @@ FII_BB_CSV                   = "fii_bb_continuation_alerts.csv"
 FII_BB_ARMED: dict = {}   # symbol -> {direction, armed_high/low, armed_at, ikey}
 FII_BB_ALERTED_TODAY: set = set()   # one entry per symbol per day (reset daily)
 
+# ========== STRATEGY 5: SMA-200 PROXIMITY + SHORT-TERM HIGH/LOW BREAKOUT ==========
+# Swing-style (multi-day) strategy, distinct from the intraday strategies above.
+#
+# Stage 1 (arm): stock's close is within SMA200_PROXIMITY_PCT of its 200-day
+#   SMA, OR has just crossed the SMA (yesterday on one side, today on the
+#   other). Direction is set by which side of the SMA the close is on:
+#   close >= SMA200 -> watch for LONG (CE); close < SMA200 -> watch for SHORT (PE).
+#
+# Stage 2 (trigger, checked daily for up to SMA200_MONITOR_DAYS days after arming):
+#   LONG:  today's close is a new 3-day high OR a new 5-day (1-week) high.
+#   SHORT: today's close is a new 3-day low  OR a new 5-day (1-week) low.
+#
+# Runs ONCE per day (not every 30s scan) near end-of-session, using live LTP
+# as a proxy for "today's close" — same convention already used elsewhere in
+# this file (e.g. ORB-15's process_first_15min_candles treats live LTP as the
+# candle's running close before the candle has actually closed).
+ENABLE_SMA200_BREAKOUT       = True
+SMA200_PERIOD                = 200     # 200-day SMA
+SMA200_PROXIMITY_PCT         = 2.0     # "within 1-2%" — use 2.0 as the outer band
+SMA200_MONITOR_DAYS          = 10      # watch for 5-10 days after arming, then drop
+SMA200_SHORT_HIGH_DAYS       = 3       # "3-day high"
+SMA200_WEEK_HIGH_DAYS        = 5       # "1-week (5-day) high"
+SMA200_MIN_DAILY_CANDLES     = 200     # minimum daily candles required to trust the SMA
+SMA200_FULL_FETCH_DAYS       = 400     # calendar days to backfill if cache is too short
+SMA200_DAILY_SCAN_TIME       = "15:00" # run the once-daily scan at/after this IST time
+SMA200_MAX_ORDERS            = 5
+SMA200_CSV                   = "sma200_breakout_alerts.csv"
+
+SMA200_WATCHLIST: dict = {}   # symbol -> {'direction','armed_date','sma_at_arm'}
+SMA200_ALERTED_TODAY: set = set()     # (symbol) fired today — daily reset
+SMA200_LAST_SCAN_DATE = None          # date of the last daily scan (once-per-day gate)
+SMA200_ORDER_COUNT = 0
+
+
 
 OPTION_PREMIUM_MIN_THRESHOLD = 1.0  # Minimum premium to consider
 OPTION_PREMIUM_MAX_THRESHOLD = 500.0  # Maximum premium to consider
@@ -4652,6 +4686,8 @@ def check_orb_time_and_process(access_token, live_data):
         FIIDII_BRK_ALERTED.clear()
         FII_BB_ALERTED_TODAY.clear()   # daily reset — but FII_BB_ARMED persists
                                        # across days by design (continuous 2-3 day watch)
+        SMA200_ALERTED_TODAY.clear()   # daily reset — SMA200_WATCHLIST persists across
+                                       # days by design (5-10 day monitoring window)
         global ORB_15_PROCESSED_TODAY, ORB_15_ORDER_COUNT
         ORB_15_SIGNALS.clear()
         ORB_15_ALERTED_STOCKS.clear()
@@ -12024,6 +12060,254 @@ def scan_fii_bb_continuation(access_token, live_data):
     return signals
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY 5: SMA-200 PROXIMITY + SHORT-TERM HIGH/LOW BREAKOUT (swing-style)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_daily_candles_for_sma200(access_token, symbol, instrument_key):
+    """Ensure at least SMA200_MIN_DAILY_CANDLES daily candles are available.
+
+    Reuses the EXISTING daily-candle cache (get_cached_or_fetch_candles /
+    fetch_and_cache_full_history) rather than building a separate cache
+    system — the default full-history fetch used elsewhere is only 120
+    calendar days (~83 trading days), too short for a 200-day SMA. When the
+    existing cache is too short, this backfills with a longer fetch
+    (SMA200_FULL_FETCH_DAYS) and saves it back to the SAME cache file, which
+    also benefits the Klinger/R3-S3 calculations that read the same cache.
+    """
+    try:
+        df = get_cached_or_fetch_candles(access_token, symbol, instrument_key)
+        if df is not None and len(df) >= SMA200_MIN_DAILY_CANDLES:
+            return df
+        # Cache too short (or missing) — backfill with a longer fetch.
+        df = fetch_and_cache_full_history(access_token, symbol, instrument_key,
+                                          days=SMA200_FULL_FETCH_DAYS)
+        if df is None or len(df) < SMA200_MIN_DAILY_CANDLES:
+            if DEBUG_MODE:
+                n = len(df) if df is not None else 0
+                print(f"⛔ SMA200 {symbol}: only {n} daily candles available "
+                      f"(need {SMA200_MIN_DAILY_CANDLES})")
+            return None
+        return df
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⛔ get_daily_candles_for_sma200 {symbol}: {e}")
+        return None
+
+
+def update_sma200_watchlist(access_token, live_data):
+    """Stage 1: scan all F&O stocks for SMA-200 proximity/cross, add
+    qualifying stocks to SMA200_WATCHLIST with a direction (LONG/SHORT).
+
+    A stock already on the watchlist is left alone here (its window and
+    direction were set when it was armed) — this only ADDS new entries.
+    """
+    global SMA200_WATCHLIST
+
+    if not ENABLE_SMA200_BREAKOUT:
+        return
+
+    today = now_ist().date()
+
+    for ikey in list(R3_LEVELS.keys()):
+        info   = R3_LEVELS.get(ikey, {})
+        symbol = info.get('symbol', ikey)
+        if symbol in SMA200_WATCHLIST:
+            continue   # already armed, Stage 2 will handle it
+
+        try:
+            df = get_daily_candles_for_sma200(access_token, symbol, ikey)
+            if df is None:
+                continue
+
+            closes = df['close']
+            sma200_series = closes.rolling(SMA200_PERIOD).mean()
+            if pd.isna(sma200_series.iloc[-1]) or pd.isna(sma200_series.iloc[-2]):
+                continue   # not enough history to compute SMA yet
+
+            live       = live_data.get(ikey, {})
+            live_ltp   = live.get('ltp', 0)
+            close_today = live_ltp if live_ltp > 0 else float(closes.iloc[-1])
+            close_yday  = float(closes.iloc[-2])
+            sma_today   = float(sma200_series.iloc[-1])
+            sma_yday    = float(sma200_series.iloc[-2])
+
+            dist_pct = abs(close_today - sma_today) / sma_today * 100 if sma_today else 999
+            near_sma = dist_pct <= SMA200_PROXIMITY_PCT
+
+            crossed_up   = close_yday < sma_yday and close_today > sma_today
+            crossed_down = close_yday > sma_yday and close_today < sma_today
+
+            if not (near_sma or crossed_up or crossed_down):
+                continue
+
+            # Direction: price above 200 SMA -> watch LONG; below -> watch SHORT.
+            direction = 'LONG' if close_today >= sma_today else 'SHORT'
+
+            SMA200_WATCHLIST[symbol] = {
+                'ikey': ikey,
+                'direction': direction,
+                'armed_date': today,
+                'sma_at_arm': sma_today,
+                'price_at_arm': close_today,
+                'reason': ('cross_up' if crossed_up else
+                          'cross_down' if crossed_down else 'proximity'),
+            }
+            if DEBUG_MODE:
+                print(f"🎯 SMA200 armed {direction}: {symbol} | price ₹{close_today:.2f} "
+                      f"vs SMA200 ₹{sma_today:.2f} ({dist_pct:.2f}% away) | "
+                      f"{'crossed' if (crossed_up or crossed_down) else 'near'}")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ update_sma200_watchlist {symbol}: {e}")
+
+
+def check_sma200_entry_triggers(access_token, live_data, trader=None):
+    """Stage 2: for every symbol on SMA200_WATCHLIST, check whether today's
+    close is a new 3-day or 5-day (1-week) high (LONG) / low (SHORT).
+    Fires an entry signal on the first trigger, then removes the symbol from
+    the watchlist. Also drops symbols whose monitoring window has expired
+    (SMA200_MONITOR_DAYS days since arming) without ever triggering.
+    """
+    global SMA200_WATCHLIST, SMA200_ALERTED_TODAY, SMA200_ORDER_COUNT
+
+    if not ENABLE_SMA200_BREAKOUT or not SMA200_WATCHLIST:
+        return []
+
+    today = now_ist().date()
+    signals = []
+    expired = []
+
+    for symbol, entry in list(SMA200_WATCHLIST.items()):
+        if symbol in SMA200_ALERTED_TODAY:
+            continue
+
+        days_watched = (today - entry['armed_date']).days
+        if days_watched > SMA200_MONITOR_DAYS:
+            expired.append(symbol)
+            continue
+
+        ikey = entry['ikey']
+        try:
+            df = get_daily_candles_for_sma200(access_token, symbol, ikey)
+            if df is None or len(df) < SMA200_WEEK_HIGH_DAYS + 1:
+                continue
+
+            live      = live_data.get(ikey, {})
+            live_ltp  = live.get('ltp', 0)
+            closes    = df['close'].copy()
+            # Treat live LTP as today's still-forming close (same convention
+            # used elsewhere in this file, e.g. ORB-15's candle processor).
+            if live_ltp > 0:
+                closes = pd.concat([closes, pd.Series([live_ltp])], ignore_index=True)
+            today_close = float(closes.iloc[-1])
+
+            last_3d = closes.tail(SMA200_SHORT_HIGH_DAYS + 1).iloc[:-1]  # exclude today
+            last_5d = closes.tail(SMA200_WEEK_HIGH_DAYS + 1).iloc[:-1]
+
+            direction = entry['direction']
+            triggered = False
+            trigger_type = None
+
+            if direction == 'LONG':
+                if today_close > last_3d.max():
+                    triggered, trigger_type = True, '3-day high'
+                elif today_close > last_5d.max():
+                    triggered, trigger_type = True, '1-week high'
+            else:  # SHORT
+                if today_close < last_3d.min():
+                    triggered, trigger_type = True, '3-day low'
+                elif today_close < last_5d.min():
+                    triggered, trigger_type = True, '1-week low'
+
+            if not triggered:
+                continue
+
+            # Stop/target: recent swing low (LONG) / swing high (SHORT) over
+            # the monitoring lookback, 2:1 reward — consistent with the
+            # other strategies in this file.
+            lookback = df.tail(SMA200_WEEK_HIGH_DAYS + 2)
+            if direction == 'LONG':
+                stop   = float(lookback['low'].min()) * 0.99
+                risk   = today_close - stop
+                target = today_close + 2.0 * risk if risk > 0 else today_close * 1.03
+                sig_direction = 'CE'
+            else:
+                stop   = float(lookback['high'].max()) * 1.01
+                risk   = stop - today_close
+                target = today_close - 2.0 * risk if risk > 0 else today_close * 0.97
+                sig_direction = 'PE'
+
+            if risk <= 0:
+                continue
+
+            fii_sig = get_fii_dii_signal(symbol)
+            confidence = ('HIGH' if (direction == 'LONG' and fii_sig in ('STRONG_BUY', 'BUY')) or
+                                    (direction == 'SHORT' and fii_sig in ('STRONG_SELL', 'SELL'))
+                          else 'MEDIUM')
+
+            SMA200_ALERTED_TODAY.add(symbol)
+            expired.append(symbol)   # remove from watchlist once triggered
+
+            signals.append({
+                'symbol': symbol, 'ikey': ikey,
+                'signal': f'SMA200_{direction}_{trigger_type.upper().replace(" ", "_").replace("-", "_")}',
+                'direction': sig_direction,
+                'entry': today_close, 'stop': stop, 'target': target,
+                'sma200': entry['sma_at_arm'], 'trigger_type': trigger_type,
+                'days_watched': days_watched, 'arm_reason': entry['reason'],
+                'vol_ratio': 0, 'fii_dii': fii_sig, 'confidence': confidence,
+                'timestamp': now_ist(),
+            })
+            print(f"{'🟢' if direction == 'LONG' else '🔴'} SMA200 {direction}: {symbol} | "
+                  f"close ₹{today_close:.2f} = new {trigger_type} | "
+                  f"SMA200 ₹{entry['sma_at_arm']:.2f} | watched {days_watched}d")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ check_sma200_entry_triggers {symbol}: {e}")
+
+    for symbol in expired:
+        SMA200_WATCHLIST.pop(symbol, None)
+
+    return signals
+
+
+def run_sma200_daily_scan(access_token, live_data, trader=None):
+    """Orchestrates Stage 1 + Stage 2, gated to run ONCE per day at/after
+    SMA200_DAILY_SCAN_TIME. This is a swing-style strategy — checking the
+    watchlist on every 30s scan would be wasteful and doesn't match the
+    'daily over the next 5-10 days' cadence in the spec.
+    """
+    global SMA200_LAST_SCAN_DATE
+
+    if not ENABLE_SMA200_BREAKOUT:
+        return
+
+    now = now_ist()
+    if now.strftime('%H:%M') < SMA200_DAILY_SCAN_TIME:
+        return
+    today = now.date()
+    if SMA200_LAST_SCAN_DATE == today:
+        return   # already ran today
+
+    SMA200_LAST_SCAN_DATE = today
+
+    print(f"\n{'='*100}")
+    print(f"📈 SMA-200 DAILY SCAN — {now.strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'='*100}")
+
+    update_sma200_watchlist(access_token, live_data)
+    signals = check_sma200_entry_triggers(access_token, live_data, trader)
+
+    print(f"Watchlist size: {len(SMA200_WATCHLIST)} | Signals today: {len(signals)}")
+    print(f"{'='*100}\n")
+
+    for sig in signals:
+        _log_and_place_new_reversal(sig, trader, SMA200_CSV, "SMA-200 BREAKOUT")
+
+
 def monitor_session_phase(live_data, access_token, trader=None):
     """Dispatcher: routes to the correct strategy based on current session phase.
 
@@ -12465,6 +12749,19 @@ def enhanced_monitor(access_token, keys, symbols):
                             print(f"{'='*80}")
                             if trader:
                                 place_breakout_order(sig, trader)
+
+                    # ── S5: SMA-200 proximity + short-term high/low breakout ──
+                    # Swing-style, runs ONCE per day (internal time gate at
+                    # SMA200_DAILY_SCAN_TIME) — not throttled by scan_count.
+                    # Isolated: a failure here must not block any other strategy.
+                    if ENABLE_SMA200_BREAKOUT:
+                        try:
+                            run_sma200_daily_scan(access_token, live_data, trader)
+                        except Exception as e:
+                            print(f"❌ S5 (SMA200_BREAKOUT) error: {e}")
+                            if DEBUG_MODE:
+                                import traceback
+                                traceback.print_exc()
 
                     # ── S4: FII/DII BB-mid cross + live continuation ──────────
                     # Runs EVERY scan (not throttled) — immediate live-break
