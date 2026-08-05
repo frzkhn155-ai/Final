@@ -10569,7 +10569,10 @@ def resample_to_1h(df5: 'pd.DataFrame') -> 'pd.DataFrame | None':
         df = df5.copy()
 
         # Ensure a proper DatetimeIndex
-        if 'timestamp' in df.columns:
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.set_index('date')
+        elif 'timestamp' in df.columns:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df = df.set_index('timestamp')
         elif not isinstance(df.index, pd.DatetimeIndex):
@@ -11231,7 +11234,10 @@ def _get_historical_high_low(access_token, ikey, symbol, lookback_days=14):
             return None, None
         import pandas as pd
         df = df5.copy()
-        if 'timestamp' in df.columns:
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.set_index('date')
+        elif 'timestamp' in df.columns:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df = df.set_index('timestamp')
         daily = df[['high', 'low', 'close', 'volume']].resample('D').agg(
@@ -11262,7 +11268,10 @@ def _get_weekly_high_low_body(access_token, ikey, symbol, lookback_days=14):
             return None, None
         import pandas as pd
         df = df5.copy()
-        if 'timestamp' in df.columns:
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.set_index('date')
+        elif 'timestamp' in df.columns:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df = df.set_index('timestamp')
         weekly = df[['open', 'high', 'low', 'close']].resample('W').agg(
@@ -11334,7 +11343,10 @@ def detect_resistance_reversal(access_token, live_data):
             # Resample to 15-min
             import pandas as pd
             df = df5.copy()
-            if 'timestamp' in df.columns:
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'])
+                df = df.set_index('date')
+            elif 'timestamp' in df.columns:
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
                 df = df.set_index('timestamp')
             df15 = df[['open', 'high', 'low', 'close', 'volume']].resample('15min').agg(
@@ -11672,9 +11684,17 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii',
 
             # ── First 1-hr candle high (with wick) ──────────────────────────
             df = df5.copy()
-            if 'timestamp' in df.columns:
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'])
+                df = df.set_index('date')
+            elif 'timestamp' in df.columns:
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
                 df = df.set_index('timestamp')
+            if not isinstance(df.index, pd.DatetimeIndex):
+                if DEBUG_MODE:
+                    print(f"⛔ detect_fiidii_confluence_breakout [{symbol}][{mode}]: "
+                          f"no datetime column found (columns: {list(df.columns)}) — skipping")
+                continue
             df1h = df[['open', 'high', 'low', 'close', 'volume']].resample('1h').agg(
                 {'open': 'first', 'high': 'max', 'low': 'min',
                  'close': 'last', 'volume': 'sum'}
