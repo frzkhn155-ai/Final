@@ -98,9 +98,29 @@ CHARTINK_COOKIES = {
 # 2. DevTools (F12) → Network → refresh → click any chartink.com request
 # 3. Copy XSRF-TOKEN and ci_session from Request Headers → Cookies
 
+# ========== STATIC IP PROXY (SEBI compliance) ==========
+# SEBI mandates that all order-placement API calls come from a whitelisted
+# static IP. GitHub Actions runners get a random IP every run, so all
+# Upstox API traffic is routed through a static-IP proxy service instead.
+# Set UPSTOX_PROXY_URL as a GitHub Secret, e.g.:
+#   http://username:password@proxy-host.quotaguard.com:9293
+# Leave it unset/empty to disable proxying (e.g. for local testing).
+UPSTOX_PROXY_URL = os.environ.get("UPSTOX_PROXY_URL", "").strip()
+UPSTOX_PROXIES = ({"http": UPSTOX_PROXY_URL, "https": UPSTOX_PROXY_URL}
+                   if UPSTOX_PROXY_URL else None)
+
+if UPSTOX_PROXY_URL:
+    # Mask credentials in the startup log — never print the proxy password
+    _masked_proxy = re.sub(r'://[^@]+@', '://***:***@', UPSTOX_PROXY_URL)
+    print(f"🌐 Static IP proxy ENABLED for Upstox API calls: {_masked_proxy}")
+else:
+    print("⚠️  UPSTOX_PROXY_URL not set — Upstox calls will use the runner's "
+          "own (non-static) IP. Orders will likely fail with UDAPI1154 if "
+          "IP whitelisting is enforced on this API app.")
+
 # ========== HARDCODED TOKEN OPTION ==========
-HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIyMkM4REwiLCJqdGkiOiI2OWUxYTUxNmVhOTJhNTBmZTYwZjAwY2IiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzc2Mzk1NTQyLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NzY0NjMyMDB9.enP-ZbfL-q4JCJ78u-l9QVDUj71LOV2Ogi8QmeLXRDg"          # Intentionally blank — token is injected via UPSTOX_TOKEN secret
-USE_HARDCODED_TOKEN = True   # Disabled — bot reads upstox_token.txt written by the workflow
+HARDCODED_TOKEN = os.environ.get("UPSTOX_TOKEN", "")  # injected via GitHub Secret: UPSTOX_TOKEN
+USE_HARDCODED_TOKEN = True   # reads env var above; falls back to file / OAuth if blank
 
 # Token timestamp file
 TOKEN_TIMESTAMP_FILE = "token_timestamp.json"
@@ -1671,6 +1691,7 @@ class UpstoxLogin:
                     "redirect_uri":  UPSTOX_REDIRECT_URI,
                     "grant_type":    "authorization_code",
                 },
+                proxies=UPSTOX_PROXIES,
                 timeout=20,
             )
             if resp.status_code != 200:
@@ -2581,8 +2602,12 @@ class UpstoxTrader:
         # Persistent session — reuses TCP connection across all API calls
         self._session = requests.Session()
         self._session.headers.update(self.headers)
+        if UPSTOX_PROXIES:
+            self._session.proxies.update(UPSTOX_PROXIES)
         self._order_session = requests.Session()
         self._order_session.headers.update(self.order_headers)
+        if UPSTOX_PROXIES:
+            self._order_session.proxies.update(UPSTOX_PROXIES)
 
     # ... (all methods unchanged from original both4) ...
     def get_user_profile(self):
@@ -5048,6 +5073,7 @@ def get_token_via_android_oauth() -> str:
                     "redirect_uri":  UPSTOX_REDIRECT_URI,
                     "grant_type":    "authorization_code",
                 },
+                proxies=UPSTOX_PROXIES,
                 timeout=20,
             )
             if token_resp.status_code == 200:
@@ -5104,6 +5130,7 @@ def _refresh_upstox_token() -> str:
                 "client_id":     UPSTOX_API_KEY,
                 "client_secret": UPSTOX_API_SECRET,
             },
+            proxies=UPSTOX_PROXIES,
             timeout=15,
         )
         if resp.status_code == 200:
@@ -5345,6 +5372,8 @@ def _get_upstox_session(access_token: str) -> requests.Session:
             "Accept": "application/json",
             "Authorization": f"Bearer {token}",
         })
+        if UPSTOX_PROXIES:
+            _UPSTOX_SESSION.proxies.update(UPSTOX_PROXIES)
         _UPSTOX_SESSION_TOKEN = token
     return _UPSTOX_SESSION
 
