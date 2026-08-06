@@ -1,0 +1,11 @@
+{
+  "symbols": [
+    "AAPL",
+    "MSFT"
+  ],
+  "scan_interval_seconds": 30,
+  "buffer_pct": 0.0015,
+  "confirm_required": 2,
+  "state_path": "scanner/alert_state.json",
+  "webhook_url": null
+}
