@@ -67,16 +67,16 @@ sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 # ============ CREDENTIALS - ENV VARS (with hardcoded fallbacks) ============
 EMAIL          = os.environ.get("UPSTOX_EMAIL",    "frzkhn155@gmail.com")
 EMAIL_PASSWORD = os.environ.get("UPSTOX_PASSWORD", "vdeahogzvpsmfirv")
-MOBILE_NUMBER  = os.environ.get("UPSTOX_MOBILE",   "7397408750")
-PASSCODE       = os.environ.get("UPSTOX_PASSCODE", "952495")
+MOBILE_NUMBER  = os.environ.get("UPSTOX_MOBILE",   "")
+PASSCODE       = os.environ.get("UPSTOX_PASSCODE", "")
 
 # ── Upstox OAuth app credentials (for Android token refresh) ─────────────────
 # Get these from https://account.upstox.com/developer/apps → your app
 # API Key    = "Client ID" on the Upstox developer portal
 # API Secret = "Client Secret"
 # Redirect   = must match exactly what you set in the app (use the one below)
-UPSTOX_API_KEY      = os.environ.get("UPSTOX_API_KEY",    "ea9b2ade-6720-4a0b-a8a5-6e1710f55844")
-UPSTOX_API_SECRET   = os.environ.get("UPSTOX_API_SECRET", "csxmppf5zd")
+UPSTOX_API_KEY      = os.environ.get("UPSTOX_API_KEY",    "")
+UPSTOX_API_SECRET   = os.environ.get("UPSTOX_API_SECRET", "")
 UPSTOX_REDIRECT_URI = "http://127.0.0.1:8080/"        # must match your app settings
 
 # ── Headless OAuth local server port ─────────────────────────────────────────
@@ -89,9 +89,9 @@ UPSTOX_REFRESH_TOKEN_FILE = "upstox_refresh_token.txt"
 # ========== CHARTINK CONFIGURATION (for 5min data) ==========
 CHARTINK_BASE_URL = "https://chartink.com/oapi"
 CHARTINK_COOKIES = {
-    "_ga": "GA1.2.1533223166.1742236648",
-    "XSRF-TOKEN": "eyJpdiI6IjFkM21JUDJhSjI3eWxVRno5TnRIcVE9PSIsInZhbHVlIjoiRzRkRlh1THBGVTFoZE5Rbm5oSjhSdG84VUo1NFJLNUs1WmtIbXNOL2IxQkZWM016TkZFVE9KRk9Ed0Z3U1VTVCsvNUw1NzM2OHZxL2JoTEE3Mkx2U2x0Q0NzdEg1eThPakYwd2tvMEhsbGZlRENGbmFHalFGbGhyV2VHL2tMTEciLCJtYWMiOiJjZmY1YTc4NmQ5MTZhZTZkZjExN2YyMTc3M2QxNzIxODYyMzhkYzIwMmJkNWM3NmRkNTRmNWMwOWNmZTNmZTc1IiwidGFnIjoiIn0=",
-    "ci_session": "eyJpdiI6Ik5yWkd3UTM1N0FYbjFJcmI4NTdxWlE9PSIsInZhbHVlIjoiVDZBazRrTFdIMlRFMW52d0JFU1pSempOTndnT09jNC9tRXoxZXZwamE2RUVIQWlzQTl3b3pEa2NTYXpzQk5ZWWxEcGViUmM2ZmRBQnQxMVFFZy9SOFBBaDNScmFER3BVUWE1V21URVN3bk5IMzBNWVIyaHhmWUVsT1VDelZQVjgiLCJtYWMiOiJmNWVkN2RlMzIzNDkzNDcyZDU5Y2RhODQ5YjZjYzI4M2I0YTA0YjBhYTA4YTFkNTgwYzFjZTc5YjlmZWJiMDZiIiwidGFnIjoiIn0="
+    "_ga": os.environ.get("CHARTINK_GA", ""),
+    "XSRF-TOKEN": os.environ.get("CHARTINK_XSRF", ""),
+    "ci_session": os.environ.get("CHARTINK_SESSION", "")
 }
 # ⚠️  UPDATE CHARTINK_COOKIES FROM YOUR BROWSER if 5min data fails:
 # 1. Go to chartink.com/stocks-new in Chrome
@@ -615,6 +615,20 @@ VOLUME_DATA = {}
 INITIALIZATION_RETRIES = 0
 OPTIONS_CACHE = {}
 DAILY_ORDER_COUNT = 0
+
+# ========== LIVE-DATA STALENESS TRACKING ==========
+# get_live_prices_batch() silently drops a whole chunk of symbols from its
+# return value on any non-200 response (401/403/timeout/etc) — no error is
+# raised, results just don't include those instrument keys for that scan.
+# Every strategy iterating live_data.items() then simply never sees that
+# symbol, with zero visibility that anything went wrong. A stock can be
+# building toward a valid breakout level while its live feed has silently
+# gone stale for hours, and the bot has no way to tell you that's why no
+# signal fired.
+LAST_LIVE_SEEN: dict = {}   # instrument_key -> datetime of last successful quote
+STALE_DATA_WARN_MINUTES = 15   # warn if a symbol hasn't updated in this long
+STALE_DATA_ALREADY_WARNED: set = set()   # instrument_key — warn once per gap, not every scan
+
 GAP_ORDER_COUNT = 0
 BOX_ORDER_COUNT = 0
 RANGE_ORDER_COUNT = 0
@@ -4713,6 +4727,8 @@ def check_orb_time_and_process(access_token, live_data):
                                        # across days by design (continuous 2-3 day watch)
         SMA200_ALERTED_TODAY.clear()   # daily reset — SMA200_WATCHLIST persists across
                                        # days by design (5-10 day monitoring window)
+        LAST_LIVE_SEEN.clear()        # fresh staleness baseline each morning
+        STALE_DATA_ALREADY_WARNED.clear()
         global ORB_15_PROCESSED_TODAY, ORB_15_ORDER_COUNT
         ORB_15_SIGNALS.clear()
         ORB_15_ALERTED_STOCKS.clear()
@@ -7623,6 +7639,7 @@ def get_live_prices_batch(access_token, instrument_keys):
                                         break
                         if isin_key and isin_key in R3_LEVELS:
                             ohlc_data = quote.get('ohlc', {})
+                            _now = now_ist()
                             results[isin_key] = {
                                 'ltp': quote.get('last_price'),
                                 'high': ohlc_data.get('high'),
@@ -7630,12 +7647,23 @@ def get_live_prices_batch(access_token, instrument_keys):
                                 'open': ohlc_data.get('open'),
                                 'close': ohlc_data.get('close'),
                                 'volume': quote.get('volume'),
-                                'timestamp': now_ist()
+                                'timestamp': _now
                             }
+                            LAST_LIVE_SEEN[isin_key] = _now
+                            STALE_DATA_ALREADY_WARNED.discard(isin_key)  # feed recovered
             elif response.status_code == 429:
                 print(" ⚡ Rate limit hit, waiting...")
                 time.sleep(5)
                 continue
+            else:
+                # Whole chunk silently dropped otherwise — make this visible.
+                # This is exactly the failure mode that caused FORTIS's live
+                # feed to go stale for hours on 2026-08-07 without any log.
+                chunk_symbols = [R3_LEVELS.get(norm_key(k), {}).get('symbol', k)
+                                for k in chunk if norm_key(k) in R3_LEVELS]
+                print(f" ⚠️ Batch quote fetch failed (HTTP {response.status_code}) — "
+                      f"{len(chunk)} symbols missing from this scan's live_data "
+                      f"({', '.join(chunk_symbols[:5])}{'...' if len(chunk_symbols) > 5 else ''})")
         except Exception as e:
             if DEBUG_MODE:
                 print(f" ❌ Batch fetch error: {e}")
@@ -7644,6 +7672,46 @@ def get_live_prices_batch(access_token, instrument_keys):
     return results
 
 # ========== CALCULATION FUNCTIONS ==========
+def check_and_report_stale_data(live_data, symbols_to_check=None):
+    """Detect symbols whose live feed has gone stale (missing from live_data
+    for STALE_DATA_WARN_MINUTES or longer) and print a visible warning —
+    exactly the gap that silently prevented the FORTIS R3 signal on
+    2026-08-07: the bot kept scanning and printing scan numbers while
+    FORTIS's quote hadn't updated in 207 minutes, with zero indication
+    anything was wrong.
+
+    Warns ONCE per gap (via STALE_DATA_ALREADY_WARNED) rather than every
+    30-second scan, to avoid flooding the log once a gap is known.
+    """
+    global STALE_DATA_ALREADY_WARNED
+
+    now = now_ist()
+    check_keys = symbols_to_check if symbols_to_check else list(R3_LEVELS.keys())
+
+    for ikey in check_keys:
+        if ikey in live_data:
+            continue   # got fresh data this scan, no gap
+
+        last_seen = LAST_LIVE_SEEN.get(ikey)
+        if last_seen is None:
+            continue   # never seen at all yet (e.g. very early in session) — not a gap
+
+        age_minutes = (now - last_seen).total_seconds() / 60
+        if age_minutes < STALE_DATA_WARN_MINUTES:
+            continue   # within normal tolerance
+
+        if ikey in STALE_DATA_ALREADY_WARNED:
+            continue   # already warned for this ongoing gap
+
+        symbol = R3_LEVELS.get(ikey, {}).get('symbol', ikey)
+        print(f"\n⚠️ DATA GAP DETECTED:")
+        print(f"   {symbol} last quote = {last_seen.strftime('%H:%M:%S')}")
+        print(f"   Current scan       = {now.strftime('%H:%M:%S')}")
+        print(f"   Data age           = {age_minutes:.0f} minutes")
+        print(f"   ⛔ All strategies (R3/S3, ORB, S1-S5) will SKIP {symbol} until fresh data returns\n")
+        STALE_DATA_ALREADY_WARNED.add(ikey)
+
+
 def calc_r3(h, l, c):
     p = (h + l + c) / 3.0
     r3 = p + 2*(h - l)
@@ -12672,7 +12740,21 @@ def enhanced_monitor(access_token, keys, symbols):
                     print("⚡ No data received", flush=True)
                     time.sleep(10)
                     continue
-                
+
+                # ── Data-gap detection ────────────────────────────────────────
+                # Warns if any symbol's live quote hasn't refreshed in
+                # STALE_DATA_WARN_MINUTES — this is what silently masked the
+                # missed FORTIS R3 signal on 2026-08-07 (207-min-old quote,
+                # zero indication anything was wrong). Throttled to every
+                # 5 scans (~2.5 min) since per-scan checking of the whole
+                # universe is unnecessary and adds noise once a gap is known.
+                if scan_count % 5 == 0:
+                    try:
+                        check_and_report_stale_data(live_data)
+                    except Exception as e:
+                        if DEBUG_MODE:
+                            print(f"⚠️ Stale-data check error: {e}")
+
                 # ── Session-phase strategy dispatcher ────────────────────────
                 # Phase 1 (09:15–10:30): ORB handled below
                 # Phase 2 (10:30–13:00): Midday Box build + breakout
