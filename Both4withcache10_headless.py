@@ -555,6 +555,39 @@ SMA200_ALERTED_TODAY: set = set()     # (symbol) fired today — daily reset
 SMA200_LAST_SCAN_DATE = None          # date of the last daily scan (once-per-day gate)
 SMA200_ORDER_COUNT = 0
 
+# ========== STRATEGY 6: MULTI-TIMEFRAME MOMENTUM (Daily BB + 1H RSI + 15M body break) ==========
+# Two-stage strategy, same skeleton as S5 (swing arm -> intraday trigger),
+# but with a different, more specific confluence:
+#
+# Stage 1 (arm, once daily): Daily close crosses the Daily middle Bollinger
+#   Band (20-period SMA) -> macro trend shift. Direction set by cross
+#   direction (up = LONG watch, down = SHORT watch).
+#
+# Stage 2 (execute, checked intraday while on watchlist, up to
+#   S6_MONITOR_DAYS days):
+#   Momentum confirmation: 1H RSI > S6_RSI_LONG_THRESHOLD (LONG) or
+#     < S6_RSI_SHORT_THRESHOLD (SHORT) — "institutional backing" filter.
+#   Execution trigger: 15-min candle CLOSES beyond the previous day's BODY
+#     high/low (max/min of open,close — wicks excluded) — "whipsaw
+#     protection" filter, only trades body breaks not wick sweeps.
+#   Both conditions must hold on the SAME 15-min check for entry to fire.
+ENABLE_S6_MTF_MOMENTUM       = True
+S6_BB_PERIOD                 = 20      # Daily BB period (matches 20-SMA middle band)
+S6_RSI_PERIOD                = 14      # 1H RSI period
+S6_RSI_LONG_THRESHOLD        = 60      # 1H RSI must be above this for LONG
+S6_RSI_SHORT_THRESHOLD       = 40      # 1H RSI must be below this for SHORT (mirror)
+S6_MONITOR_DAYS              = 10      # watch for up to N days after Daily BB cross
+S6_MIN_DAILY_CANDLES         = 30      # minimum daily candles to trust the Daily BB
+S6_DAILY_SCAN_TIME           = "09:20" # Stage 1 (arming) runs once/day at/after this time
+S6_MAX_ORDERS                = 5
+S6_CSV                       = "s6_mtf_momentum_alerts.csv"
+
+S6_WATCHLIST: dict = {}       # symbol -> {'ikey','direction','armed_date','prev_day_body_high','prev_day_body_low'}
+S6_ALERTED_TODAY: set = set() # daily reset
+S6_LAST_ARM_SCAN_DATE = None  # date of the last Stage-1 arming scan
+S6_ORDER_COUNT = 0
+
+
 
 
 OPTION_PREMIUM_MIN_THRESHOLD = 1.0  # Minimum premium to consider
@@ -4729,6 +4762,8 @@ def check_orb_time_and_process(access_token, live_data):
                                        # days by design (5-10 day monitoring window)
         LAST_LIVE_SEEN.clear()        # fresh staleness baseline each morning
         STALE_DATA_ALREADY_WARNED.clear()
+        S6_ALERTED_TODAY.clear()      # daily reset — S6_WATCHLIST persists across
+                                      # days by design (up to S6_MONITOR_DAYS window)
         global ORB_15_PROCESSED_TODAY, ORB_15_ORDER_COUNT
         ORB_15_SIGNALS.clear()
         ORB_15_ALERTED_STOCKS.clear()
@@ -12425,6 +12460,236 @@ def run_sma200_daily_scan(access_token, live_data, trader=None):
         _log_and_place_new_reversal(sig, trader, SMA200_CSV, "SMA-200 BREAKOUT")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY 6: MULTI-TIMEFRAME MOMENTUM
+#  Daily BB middle cross (macro trend) + 1H RSI (momentum) + 15M previous-day
+#  body-high/low break (execution) — "Stage 1: early-warning watchlist,
+#  Stage 2: instant execution" per the pre-positioning approach.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def update_s6_watchlist(access_token):
+    """Stage 1 (once daily): scan all F&O stocks for a Daily middle-BB cross.
+
+    Direction: close crosses ABOVE Daily middle BB -> watch LONG.
+               close crosses BELOW Daily middle BB -> watch SHORT.
+    Also records the previous completed day's body high/low (max/min of
+    open, close — wicks excluded) as the Stage-2 execution level.
+    """
+    global S6_WATCHLIST
+
+    if not ENABLE_S6_MTF_MOMENTUM:
+        return
+
+    today = now_ist().date()
+
+    for ikey in list(R3_LEVELS.keys()):
+        info   = R3_LEVELS.get(ikey, {})
+        symbol = info.get('symbol', ikey)
+        if symbol in S6_WATCHLIST:
+            continue   # already armed, Stage 2 handles it
+
+        try:
+            df = get_cached_or_fetch_candles(access_token, symbol, ikey)
+            if df is None or len(df) < S6_MIN_DAILY_CANDLES:
+                continue
+
+            closes = df['close']
+            mid_bb = closes.rolling(S6_BB_PERIOD).mean()
+            if pd.isna(mid_bb.iloc[-1]) or pd.isna(mid_bb.iloc[-2]):
+                continue
+
+            close_today = float(closes.iloc[-1])
+            close_yday  = float(closes.iloc[-2])
+            mid_today   = float(mid_bb.iloc[-1])
+            mid_yday    = float(mid_bb.iloc[-2])
+
+            crossed_up   = close_yday < mid_yday and close_today > mid_today
+            crossed_down = close_yday > mid_yday and close_today < mid_today
+            if not (crossed_up or crossed_down):
+                continue
+
+            prev_day = df.iloc[-1]   # most recent COMPLETED daily candle
+            prev_day_body_high = max(float(prev_day['open']), float(prev_day['close']))
+            prev_day_body_low  = min(float(prev_day['open']), float(prev_day['close']))
+
+            direction = 'LONG' if crossed_up else 'SHORT'
+            S6_WATCHLIST[symbol] = {
+                'ikey': ikey,
+                'direction': direction,
+                'armed_date': today,
+                'prev_day_body_high': prev_day_body_high,
+                'prev_day_body_low': prev_day_body_low,
+                'daily_bb_mid_at_arm': mid_today,
+            }
+            print(f"🎯 S6 armed {direction}: {symbol} | Daily BB-mid cross "
+                  f"({'up' if crossed_up else 'down'}) | close ₹{close_today:.2f} vs "
+                  f"mid ₹{mid_today:.2f} | prev-day body H/L ₹{prev_day_body_high:.2f}/₹{prev_day_body_low:.2f}")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ update_s6_watchlist {symbol}: {e}")
+
+
+def check_s6_entry_triggers(access_token, live_data, trader=None):
+    """Stage 2 (intraday, throttled): for every symbol on S6_WATCHLIST,
+    check the momentum + execution confluence:
+      1H RSI confirms momentum (> 60 for LONG, < 40 for SHORT), AND
+      15-min candle CLOSES beyond the previous day's body high/low.
+    Both must hold on the same check for entry to fire. Drops symbols
+    whose S6_MONITOR_DAYS window has expired without triggering.
+    """
+    global S6_WATCHLIST, S6_ALERTED_TODAY, S6_ORDER_COUNT
+
+    if not ENABLE_S6_MTF_MOMENTUM or not S6_WATCHLIST:
+        return []
+
+    today = now_ist().date()
+    signals = []
+    expired = []
+
+    for symbol, entry in list(S6_WATCHLIST.items()):
+        if symbol in S6_ALERTED_TODAY:
+            continue
+
+        days_watched = (today - entry['armed_date']).days
+        if days_watched > S6_MONITOR_DAYS:
+            expired.append(symbol)
+            continue
+
+        ikey = entry['ikey']
+        try:
+            df5 = fetch_5min_cached(access_token, ikey, bars=120, symbol=symbol)
+            if df5 is None or len(df5) < 20:
+                continue
+
+            # ── Momentum confirmation: 1H RSI ─────────────────────────────
+            df1h = resample_to_1h(df5)
+            if df1h is None or len(df1h) < S6_RSI_PERIOD + 2:
+                continue
+            rsi_1h = calculate_rsi(df1h, period=S6_RSI_PERIOD)
+            if rsi_1h is None:
+                continue
+
+            direction = entry['direction']
+            if direction == 'LONG' and rsi_1h <= S6_RSI_LONG_THRESHOLD:
+                if DEBUG_MODE:
+                    print(f"⛔ S6 {symbol}: 1H RSI {rsi_1h:.1f} <= {S6_RSI_LONG_THRESHOLD} (LONG needs momentum)")
+                continue
+            if direction == 'SHORT' and rsi_1h >= S6_RSI_SHORT_THRESHOLD:
+                if DEBUG_MODE:
+                    print(f"⛔ S6 {symbol}: 1H RSI {rsi_1h:.1f} >= {S6_RSI_SHORT_THRESHOLD} (SHORT needs momentum)")
+                continue
+
+            # ── Execution trigger: 15-min body break of prev-day level ────
+            import pandas as _pd
+            df = df5.copy()
+            if 'date' in df.columns:
+                df['date'] = _pd.to_datetime(df['date'])
+                df = df.set_index('date')
+            elif 'timestamp' in df.columns:
+                df['timestamp'] = _pd.to_datetime(df['timestamp'])
+                df = df.set_index('timestamp')
+            if not isinstance(df.index, _pd.DatetimeIndex):
+                continue
+            df15 = df[['open', 'high', 'low', 'close', 'volume']].resample('15min').agg(
+                {'open': 'first', 'high': 'max', 'low': 'min',
+                 'close': 'last', 'volume': 'sum'}
+            ).dropna().reset_index()
+            if len(df15) < 2:
+                continue
+
+            last15 = df15.iloc[-2]   # last COMPLETED 15-min candle
+            body_high = entry['prev_day_body_high']
+            body_low  = entry['prev_day_body_low']
+
+            triggered = False
+            if direction == 'LONG' and float(last15['close']) > body_high:
+                triggered = True
+            elif direction == 'SHORT' and float(last15['close']) < body_low:
+                triggered = True
+
+            if not triggered:
+                continue
+
+            live      = live_data.get(ikey, {})
+            entry_ltp = live.get('ltp', 0) or float(last15['close'])
+
+            # Stop/target: prior day's opposite body level as stop, 2:1 reward.
+            if direction == 'LONG':
+                stop   = body_low * 0.995
+                risk   = entry_ltp - stop
+                target = entry_ltp + 2.0 * risk if risk > 0 else entry_ltp * 1.02
+                sig_direction = 'CE'
+            else:
+                stop   = body_high * 1.005
+                risk   = stop - entry_ltp
+                target = entry_ltp - 2.0 * risk if risk > 0 else entry_ltp * 0.98
+                sig_direction = 'PE'
+
+            if risk <= 0:
+                continue
+
+            fii_sig = get_fii_dii_signal(symbol)
+            confidence = ('HIGH' if (direction == 'LONG' and fii_sig in ('STRONG_BUY', 'BUY')) or
+                                    (direction == 'SHORT' and fii_sig in ('STRONG_SELL', 'SELL'))
+                          else 'MEDIUM')
+
+            S6_ALERTED_TODAY.add(symbol)
+            expired.append(symbol)   # remove from watchlist once triggered
+
+            signals.append({
+                'symbol': symbol, 'ikey': ikey,
+                'signal': f'S6_MTF_MOMENTUM_{direction}',
+                'direction': sig_direction,
+                'entry': entry_ltp, 'stop': stop, 'target': target,
+                'rsi_1h': round(rsi_1h, 1),
+                'prev_day_body_high': body_high, 'prev_day_body_low': body_low,
+                'days_watched': days_watched,
+                'vol_ratio': 0, 'fii_dii': fii_sig, 'confidence': confidence,
+                'timestamp': now_ist(),
+            })
+            print(f"{'🟢' if direction == 'LONG' else '🔴'} S6 MTF Momentum {direction}: {symbol} | "
+                  f"15M close ₹{last15['close']:.2f} broke prev-day body "
+                  f"{'high' if direction=='LONG' else 'low'} ₹{body_high if direction=='LONG' else body_low:.2f} | "
+                  f"1H RSI {rsi_1h:.1f} | watched {days_watched}d")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ check_s6_entry_triggers {symbol}: {e}")
+
+    for symbol in expired:
+        S6_WATCHLIST.pop(symbol, None)
+
+    return signals
+
+
+def run_s6_arming_scan(access_token):
+    """Stage 1 orchestrator — gated to run ONCE per day (Daily-candle-based,
+    doesn't need to run every scan). Stage 2 (check_s6_entry_triggers) is
+    called separately, throttled intraday like S1-S4, since it depends on
+    live 15-min/1H data that updates throughout the session.
+    """
+    global S6_LAST_ARM_SCAN_DATE
+
+    if not ENABLE_S6_MTF_MOMENTUM:
+        return
+
+    now = now_ist()
+    if now.strftime('%H:%M') < S6_DAILY_SCAN_TIME:
+        return
+    today = now.date()
+    if S6_LAST_ARM_SCAN_DATE == today:
+        return
+
+    S6_LAST_ARM_SCAN_DATE = today
+    print(f"\n{'='*100}")
+    print(f"📈 S6 DAILY ARMING SCAN — {now.strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'='*100}")
+    update_s6_watchlist(access_token)
+    print(f"S6 Watchlist size: {len(S6_WATCHLIST)}")
+    print(f"{'='*100}\n")
+
+
 def monitor_session_phase(live_data, access_token, trader=None):
     """Dispatcher: routes to the correct strategy based on current session phase.
 
@@ -12881,6 +13146,21 @@ def enhanced_monitor(access_token, keys, symbols):
                             if trader:
                                 place_breakout_order(sig, trader)
 
+                    # ── S6: Multi-timeframe momentum (Daily BB + 1H RSI + 15M) ─
+                    # Stage 1 (arming) runs ONCE per day via internal time gate.
+                    # Stage 2 (trigger) is throttled with the other S1-S4
+                    # intraday checks below (scan_count % 2 == 0), since it
+                    # depends on live 15-min/1H data that updates all session.
+                    # Isolated: a failure here must not block any other strategy.
+                    if ENABLE_S6_MTF_MOMENTUM:
+                        try:
+                            run_s6_arming_scan(access_token)
+                        except Exception as e:
+                            print(f"❌ S6 (MTF_MOMENTUM arming) error: {e}")
+                            if DEBUG_MODE:
+                                import traceback
+                                traceback.print_exc()
+
                     # ── S5: SMA-200 proximity + short-term high/low breakout ──
                     # Swing-style, runs ONCE per day (internal time gate at
                     # SMA200_DAILY_SCAN_TIME) — not throttled by scan_count.
@@ -12922,6 +13202,20 @@ def enhanced_monitor(access_token, keys, symbols):
                     # would jump straight to "❌ Monitor loop error" and skip
                     # every strategy after it for that entire scan cycle.
                     if scan_count % 2 == 0:
+
+                        # S6 Stage 2: momentum + 15M body-break trigger check
+                        if ENABLE_S6_MTF_MOMENTUM:
+                            try:
+                                s6_sigs = check_s6_entry_triggers(access_token, live_data, trader)
+                                if DEBUG_MODE and VERBOSE_STRATEGY_HEARTBEAT:
+                                    print(f"🔍 S6 (MTF_MOMENTUM): scanned, {len(s6_sigs)} signal(s)")
+                                for sig in s6_sigs:
+                                    _log_and_place_new_reversal(sig, trader, S6_CSV, "MTF MOMENTUM")
+                            except Exception as e:
+                                print(f"❌ S6 (MTF_MOMENTUM trigger) error: {e}")
+                                if DEBUG_MODE:
+                                    import traceback
+                                    traceback.print_exc()
 
                         # S1: Big opening candle + resistance reversal
                         if ENABLE_RESISTANCE_REVERSAL:
