@@ -12,7 +12,7 @@ Email: frzkhn155@gmail.com
 ============================================================
 
 🔑 Step 1: Checking HARDCODED token...
-Token preview: eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOi...LJvhiu2JImIG6gqc_6Tg
+Token preview: eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOi..._uq8B7R8w12AoMRgs20k
 🔍 Verifying API token...
 ⚠️  JWT exp field: 03:30 IST (now 09:16) — Upstox servers stay live until ~03:30 IST; confirming via API...
 ❌ Token REJECTED by Upstox API (401) — needs fresh login
@@ -42,41 +42,21 @@ Token preview: eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOi...dQJ4ARHjAsr5PKtgLMWE
 
 🤖 HEADLESS OAUTH LOGIN
 🌐 Opening login page (headless)…
-✅ Deleted 3 Upstox emails from inbox
+✅ Deleted 6 Upstox emails from inbox
 📨 OTP requested.
 ⏳ Waiting for NEW OTP email (checking every 3 seconds, max 120s)...
-🕐 OTP requested at: 09:18:23
+🕐 OTP requested at: 09:20:53
 ⏱️ Waiting 8 seconds for email to arrive...
 📬 Found 1 unread email(s) from Upstox
 📄 Email body preview: <!DOCTYPE html><html lang='en' xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:v='urn:schemas-microsoft-com:vml' style='box-sizing: border-box;'><head style='box-sizing: border-box;'><title st...
-🎯 Pattern '(?:<b>|>)\s*(\d{6})\s*(?:</b>|<)' matched OTP: 584269
+🎯 Pattern '(?:<b>|>)\s*(\d{6})\s*(?:</b>|<)' matched OTP: 486844
 
-✅ OTP EXTRACTED: 584269
+✅ OTP EXTRACTED: 486844
    📧 From: Upstox <donotreply@transactions.upstox.com>
    📋 Subject: OTP to login
    ⏰ Received: N/A
 ✅ OTP submitted.
-ℹ️ PIN step skipped: Message: 
-Stacktrace:
-#0 0x55b23ef1c36a <unknown>
-#1 0x55b23e88ff49 <unknown>
-#2 0x55b23e8e57e2 <unknown>
-#3 0x55b23e8e5a31 <unknown>
-#4 0x55b23e930ed4 <unknown>
-#5 0x55b23e92e0c3 <unknown>
-#6 0x55b23e8d8c92 <unknown>
-#7 0x55b23e8d9b11 <unknown>
-#8 0x55b23eee18d0 <unknown>
-#9 0x55b23eedff3a <unknown>
-#10 0x55b23eeca9b5 <unknown>
-#11 0x55b23eee0c0a <unknown>
-#12 0x55b23eeb2740 <unknown>
-#13 0x55b23ef079a8 <unknown>
-#14 0x55b23ef07b45 <unknown>
-#15 0x55b23ef1af1e <unknown>
-#16 0x7fbece09cb84 <unknown>
-#17 0x7fbece129d6c <unknown>
-
+✅ PIN submitted.
 ⏳ Waiting for OAuth redirect…
 ❌ No auth code received after 30 s.
 🚪 Browser closed
