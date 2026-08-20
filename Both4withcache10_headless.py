@@ -555,6 +555,55 @@ SMA200_ALERTED_TODAY: set = set()     # (symbol) fired today — daily reset
 SMA200_LAST_SCAN_DATE = None          # date of the last daily scan (once-per-day gate)
 SMA200_ORDER_COUNT = 0
 
+# ========== STRATEGY 6: BODY-BREAK (Early Trend Acceleration) ==========
+# Multi-timeframe momentum continuation. Arms on Daily+1H regime, executes
+# on a 15-min body break of the previous day's body high (no wicks).
+#   Daily: close > BB(20) middle, EMA5 rising, SMA20 flat/rising
+#   1H:    RSI(14) > 60
+#   15M:   completed candle body closes above previous day's max(open,close)
+# Risk: SL = 1.5x ATR(14), Target = 2.5R, breakeven trail at +1R.
+ENABLE_BODYBREAK_STRATEGY   = True
+BODYBREAK_RSI_THRESHOLD     = 60.0
+BODYBREAK_SL_ATR_MULT       = 1.5
+BODYBREAK_TARGET_R          = 2.5
+BODYBREAK_BREAKEVEN_AT_R    = 1.0    # move stop to entry once price reaches +1R
+BODYBREAK_MONITOR_DAYS      = 10     # drop from watchlist if untriggered after N days
+BODYBREAK_MAX_ORDERS        = 5
+BODYBREAK_CSV               = "bodybreak_alerts.csv"
+
+BODYBREAK_WATCHLIST: dict = {}       # symbol -> {ikey, armed_date, prev_day_body_high}
+BODYBREAK_ALERTED_TODAY: set = set()
+BODYBREAK_LAST_SCAN_DATE = None
+BODYBREAK_ORDER_COUNT = 0
+
+# ========== STRATEGY 7: PULLBACK (Established Trend Dips) ==========
+# Same daily regime filter as S6, but buys dips within the trend instead of
+# chasing strength.
+#   Daily: same regime filter as S6
+#   1H:    RSI(14) > 55 AND close > EMA20(1H)
+#   15M:   price pulls back to/within 0.3% below 15M EMA20, next candle is
+#          bullish (body > 40% of range) and closes above EMA20
+# Risk: SL = 1.2x ATR(14), Target = 2.0R, trail under 15M EMA20 once +1.5R.
+ENABLE_PULLBACK_STRATEGY    = True
+PULLBACK_RSI_THRESHOLD      = 55.0
+PULLBACK_TOUCH_BAND_PCT     = 0.3    # "touches or dips 0.3% below" 15M EMA20
+PULLBACK_MIN_BODY_PCT       = 40.0   # confirming candle body >= 40% of its range
+PULLBACK_SL_ATR_MULT        = 1.2
+PULLBACK_TARGET_R           = 2.0
+PULLBACK_TRAIL_TRIGGER_R    = 1.5    # start trailing under 15M EMA20 once +1.5R
+PULLBACK_MONITOR_DAYS       = 10
+PULLBACK_MAX_ORDERS         = 5
+PULLBACK_CSV                = "pullback_alerts.csv"
+
+PULLBACK_WATCHLIST: dict = {}        # symbol -> {ikey, armed_date}
+PULLBACK_ALERTED_TODAY: set = set()
+PULLBACK_LAST_SCAN_DATE = None
+PULLBACK_ORDER_COUNT = 0
+
+# Shared regime-scan gate: both S6 and S7 run once per day (not every 30s scan)
+S6S7_DAILY_SCAN_TIME        = "15:05"   # slightly after S5's 15:00 to spread API load
+
+
 # ========== STRATEGY 6: MULTI-TIMEFRAME MOMENTUM (Daily BB + 1H RSI + 15M body break) ==========
 # Two-stage strategy, same skeleton as S5 (swing arm -> intraday trigger),
 # but with a different, more specific confluence:
@@ -4762,6 +4811,8 @@ def check_orb_time_and_process(access_token, live_data):
                                        # days by design (5-10 day monitoring window)
         LAST_LIVE_SEEN.clear()        # fresh staleness baseline each morning
         STALE_DATA_ALREADY_WARNED.clear()
+        BODYBREAK_ALERTED_TODAY.clear()   # watchlist persists across days by design
+        PULLBACK_ALERTED_TODAY.clear()    # watchlist persists across days by design
         S6_ALERTED_TODAY.clear()      # daily reset — S6_WATCHLIST persists across
                                       # days by design (up to S6_MONITOR_DAYS window)
         global ORB_15_PROCESSED_TODAY, ORB_15_ORDER_COUNT
@@ -5370,6 +5421,32 @@ def calculate_rsi(df, period=14):
     rsi = 100 - (100 / (1 + rs))
     val = rsi.iloc[-1]
     return float(val) if not np.isnan(val) else None
+
+def calculate_atr(df, period=14):
+    """Average True Range over `period` bars. Returns the last ATR value
+    as a float, or None if insufficient data. Used by S6/S7 for
+    volatility-scaled stop-loss sizing (1.5x ATR / 1.2x ATR respectively).
+    """
+    if len(df) < period + 1:
+        return None
+    high, low, close = df['high'], df['low'], df['close']
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    val = atr.iloc[-1]
+    return float(val) if not pd.isna(val) else None
+
+
+def calculate_ema(series, period):
+    """Simple EMA helper — returns the full EMA series (not just last value),
+    used where we need to compare current vs prior bar (e.g. 'EMA5 rising').
+    """
+    return series.ewm(span=period, adjust=False).mean()
+
 
 def detect_bollinger_squeeze(bb_width, threshold=0.15, lookback=10):
     """
@@ -12690,6 +12767,347 @@ def run_s6_arming_scan(access_token):
     print(f"{'='*100}\n")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY 6: BODY-BREAK (Early Trend Acceleration)
+#  STRATEGY 7: PULLBACK (Established Trend Dips)
+#  Both share the same Daily+1H regime filter, diverge at the 15M execution
+#  layer. Reuse the SAME daily-candle cache infrastructure as S5 (SMA-200).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _check_daily_regime_filter(df_daily):
+    """Shared Daily-timeframe regime filter used by BOTH S6 and S7:
+      close > BB(20) middle, EMA5 rising, SMA20 flat/rising.
+    Returns True/False. df_daily must have >= 25 rows (20 for BB + a few
+    extra for the 'rising' comparison).
+    """
+    if df_daily is None or len(df_daily) < 25:
+        return False
+    try:
+        up, mid, lo, _, _ = calculate_bollinger_bands(df_daily, period=20)
+        if mid is None or pd.isna(mid.iloc[-1]):
+            return False
+        close_today = float(df_daily['close'].iloc[-1])
+        bb_mid_today = float(mid.iloc[-1])
+        if close_today <= bb_mid_today:
+            return False
+
+        ema5 = calculate_ema(df_daily['close'], 5)
+        ema5_rising = float(ema5.iloc[-1]) > float(ema5.iloc[-2])
+        if not ema5_rising:
+            return False
+
+        sma20 = df_daily['close'].rolling(20).mean()
+        sma20_flat_or_rising = float(sma20.iloc[-1]) >= float(sma20.iloc[-2]) * 0.999
+        if not sma20_flat_or_rising:
+            return False
+
+        return True
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⛔ _check_daily_regime_filter: {e}")
+        return False
+
+
+def _resample_15min(df5):
+    """Resample 5-min bars to 15-min. Reuses the SAME 'date' column pattern
+    already fixed in resample_to_1h() etc. Returns None on failure."""
+    try:
+        df = df5.copy()
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.set_index('date')
+        elif 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.set_index('timestamp')
+        elif not isinstance(df.index, pd.DatetimeIndex):
+            return None
+        df15 = df[['open', 'high', 'low', 'close', 'volume']].resample('15min').agg(
+            {'open': 'first', 'high': 'max', 'low': 'min',
+             'close': 'last', 'volume': 'sum'}
+        ).dropna().reset_index()
+        return df15
+    except Exception:
+        return None
+
+
+def update_bodybreak_pullback_watchlist(access_token, live_data):
+    """Stage 1 (shared arming): for every F&O stock, check the Daily regime
+    filter + 1H RSI. Symbols passing arm into whichever watchlist(s) their
+    RSI threshold qualifies for (a stock can be on BOTH watchlists — S6 and
+    S7 are not mutually exclusive; S7 additionally requires close > EMA20-1H).
+    """
+    global BODYBREAK_WATCHLIST, PULLBACK_WATCHLIST
+
+    today = now_ist().date()
+
+    for ikey in list(R3_LEVELS.keys()):
+        info   = R3_LEVELS.get(ikey, {})
+        symbol = info.get('symbol', ikey)
+        already_on_both = symbol in BODYBREAK_WATCHLIST and symbol in PULLBACK_WATCHLIST
+        if already_on_both:
+            continue
+
+        try:
+            df_daily = get_daily_candles_for_sma200(access_token, symbol, ikey)  # reuse S5's cache helper
+            if not _check_daily_regime_filter(df_daily):
+                continue
+
+            df5 = fetch_5min_cached(access_token, ikey, bars=200, symbol=symbol)
+            if df5 is None or len(df5) < 30:
+                continue
+            df1h = resample_to_1h(df5)
+            if df1h is None or len(df1h) < 22:
+                continue
+
+            rsi_1h = calculate_rsi(df1h, period=14)
+            if rsi_1h is None:
+                continue
+
+            # ── S6 arming: RSI > 60 ────────────────────────────────────────
+            if (ENABLE_BODYBREAK_STRATEGY and symbol not in BODYBREAK_WATCHLIST
+                    and rsi_1h > BODYBREAK_RSI_THRESHOLD):
+                prev_day = df_daily.iloc[-2]  # previous COMPLETED daily candle
+                prev_day_body_high = max(float(prev_day['open']), float(prev_day['close']))
+                BODYBREAK_WATCHLIST[symbol] = {
+                    'ikey': ikey, 'armed_date': today,
+                    'prev_day_body_high': prev_day_body_high,
+                    'rsi_at_arm': rsi_1h,
+                }
+                if DEBUG_MODE:
+                    print(f"🎯 BODYBREAK armed: {symbol} | 1H RSI={rsi_1h:.1f} | "
+                          f"prev-day body high ₹{prev_day_body_high:.2f}")
+
+            # ── S7 arming: RSI > 55 AND close > EMA20(1H) ───────────────────
+            if (ENABLE_PULLBACK_STRATEGY and symbol not in PULLBACK_WATCHLIST
+                    and rsi_1h > PULLBACK_RSI_THRESHOLD):
+                ema20_1h = calculate_ema(df1h['close'], 20)
+                close_1h = float(df1h['close'].iloc[-1])
+                if close_1h > float(ema20_1h.iloc[-1]):
+                    PULLBACK_WATCHLIST[symbol] = {
+                        'ikey': ikey, 'armed_date': today,
+                        'rsi_at_arm': rsi_1h,
+                    }
+                    if DEBUG_MODE:
+                        print(f"🎯 PULLBACK armed: {symbol} | 1H RSI={rsi_1h:.1f} | "
+                              f"close ₹{close_1h:.2f} > EMA20(1H) ₹{float(ema20_1h.iloc[-1]):.2f}")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ update_bodybreak_pullback_watchlist {symbol}: {e}")
+
+
+def check_bodybreak_entry_triggers(access_token, live_data, trader=None):
+    """Stage 2 for S6: 15-min completed candle body closes above the
+    previous day's body high (max(open,close), no wicks).
+    """
+    global BODYBREAK_WATCHLIST, BODYBREAK_ALERTED_TODAY, BODYBREAK_ORDER_COUNT
+
+    if not ENABLE_BODYBREAK_STRATEGY or not BODYBREAK_WATCHLIST:
+        return []
+
+    today = now_ist().date()
+    signals = []
+    expired = []
+
+    for symbol, entry in list(BODYBREAK_WATCHLIST.items()):
+        if symbol in BODYBREAK_ALERTED_TODAY:
+            continue
+        days_watched = (today - entry['armed_date']).days
+        if days_watched > BODYBREAK_MONITOR_DAYS:
+            expired.append(symbol)
+            continue
+
+        ikey = entry['ikey']
+        try:
+            df5 = fetch_5min_cached(access_token, ikey, bars=120, symbol=symbol)
+            if df5 is None or len(df5) < 20:
+                continue
+            df15 = _resample_15min(df5)
+            if df15 is None or len(df15) < 3:
+                continue
+
+            last15 = df15.iloc[-2]   # last COMPLETED 15-min candle
+            body_close = float(last15['close'])
+            level = entry['prev_day_body_high']
+
+            if body_close <= level:
+                continue   # not triggered yet
+
+            atr = calculate_atr(df5.tail(60), period=14)
+            if atr is None or atr <= 0:
+                continue
+
+            entry_price = body_close
+            stop   = entry_price - BODYBREAK_SL_ATR_MULT * atr
+            risk   = entry_price - stop
+            if risk <= 0:
+                continue
+            target = entry_price + BODYBREAK_TARGET_R * risk
+
+            fii_sig = get_fii_dii_signal(symbol)
+            confidence = 'HIGH' if fii_sig in ('STRONG_BUY', 'BUY') else 'MEDIUM'
+
+            BODYBREAK_ALERTED_TODAY.add(symbol)
+            expired.append(symbol)
+
+            signals.append({
+                'symbol': symbol, 'ikey': ikey,
+                'signal': 'BODYBREAK_LONG', 'direction': 'CE',
+                'entry': entry_price, 'stop': stop, 'target': target,
+                'atr': atr, 'prev_day_body_high': level,
+                'rsi_at_arm': entry['rsi_at_arm'], 'days_watched': days_watched,
+                'breakeven_at_r': BODYBREAK_BREAKEVEN_AT_R,
+                'vol_ratio': 0, 'fii_dii': fii_sig, 'confidence': confidence,
+                'timestamp': now_ist(),
+            })
+            print(f"🟢 BODYBREAK LONG: {symbol} | body close ₹{entry_price:.2f} > "
+                  f"prev-day body high ₹{level:.2f} | ATR {atr:.2f} | watched {days_watched}d")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ check_bodybreak_entry_triggers {symbol}: {e}")
+
+    for symbol in expired:
+        BODYBREAK_WATCHLIST.pop(symbol, None)
+
+    return signals
+
+
+def check_pullback_entry_triggers(access_token, live_data, trader=None):
+    """Stage 2 for S7: price pulls back to/within PULLBACK_TOUCH_BAND_PCT
+    below 15M EMA20, then the NEXT completed 15-min candle is bullish
+    (body >= 40% of its range) and closes above EMA20.
+    """
+    global PULLBACK_WATCHLIST, PULLBACK_ALERTED_TODAY, PULLBACK_ORDER_COUNT
+
+    if not ENABLE_PULLBACK_STRATEGY or not PULLBACK_WATCHLIST:
+        return []
+
+    today = now_ist().date()
+    signals = []
+    expired = []
+
+    for symbol, entry in list(PULLBACK_WATCHLIST.items()):
+        if symbol in PULLBACK_ALERTED_TODAY:
+            continue
+        days_watched = (today - entry['armed_date']).days
+        if days_watched > PULLBACK_MONITOR_DAYS:
+            expired.append(symbol)
+            continue
+
+        ikey = entry['ikey']
+        try:
+            df5 = fetch_5min_cached(access_token, ikey, bars=120, symbol=symbol)
+            if df5 is None or len(df5) < 30:
+                continue
+            df15 = _resample_15min(df5)
+            if df15 is None or len(df15) < 25:
+                continue   # need enough bars for EMA20(15min) to be meaningful
+
+            ema20_15 = calculate_ema(df15['close'], 20)
+
+            prev15 = df15.iloc[-3]   # the pullback candle
+            last15 = df15.iloc[-2]   # the confirming candle (last completed)
+
+            ema20_at_prev = float(ema20_15.iloc[-3])
+            ema20_at_last = float(ema20_15.iloc[-2])
+
+            # Pullback condition: prior candle touched or dipped up to
+            # PULLBACK_TOUCH_BAND_PCT below EMA20.
+            touch_band = ema20_at_prev * (1 - PULLBACK_TOUCH_BAND_PCT / 100)
+            pulled_back = float(prev15['low']) <= ema20_at_prev and float(prev15['low']) >= touch_band
+
+            if not pulled_back:
+                continue
+
+            # Confirming candle: bullish, body >= 40% of range, closes above EMA20
+            body = float(last15['close']) - float(last15['open'])
+            candle_range = float(last15['high']) - float(last15['low'])
+            body_pct = (body / candle_range * 100) if candle_range > 0 else 0
+            is_bullish = body > 0
+            closes_above_ema = float(last15['close']) > ema20_at_last
+
+            if not (is_bullish and body_pct >= PULLBACK_MIN_BODY_PCT and closes_above_ema):
+                continue
+
+            atr = calculate_atr(df5.tail(60), period=14)
+            if atr is None or atr <= 0:
+                continue
+
+            entry_price = float(last15['close'])
+            stop   = entry_price - PULLBACK_SL_ATR_MULT * atr
+            risk   = entry_price - stop
+            if risk <= 0:
+                continue
+            target = entry_price + PULLBACK_TARGET_R * risk
+
+            fii_sig = get_fii_dii_signal(symbol)
+            confidence = 'HIGH' if fii_sig in ('STRONG_BUY', 'BUY') else 'MEDIUM'
+
+            PULLBACK_ALERTED_TODAY.add(symbol)
+            expired.append(symbol)
+
+            signals.append({
+                'symbol': symbol, 'ikey': ikey,
+                'signal': 'PULLBACK_LONG', 'direction': 'CE',
+                'entry': entry_price, 'stop': stop, 'target': target,
+                'atr': atr, 'ema20_15min': ema20_at_last, 'body_pct': round(body_pct, 1),
+                'rsi_at_arm': entry['rsi_at_arm'], 'days_watched': days_watched,
+                'trail_trigger_r': PULLBACK_TRAIL_TRIGGER_R,
+                'vol_ratio': 0, 'fii_dii': fii_sig, 'confidence': confidence,
+                'timestamp': now_ist(),
+            })
+            print(f"🟢 PULLBACK LONG: {symbol} | entry ₹{entry_price:.2f} | "
+                  f"EMA20(15m) ₹{ema20_at_last:.2f} | body {body_pct:.0f}% | watched {days_watched}d")
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⛔ check_pullback_entry_triggers {symbol}: {e}")
+
+    for symbol in expired:
+        PULLBACK_WATCHLIST.pop(symbol, None)
+
+    return signals
+
+
+def run_bodybreak_pullback_daily_scan(access_token, live_data, trader=None):
+    """Orchestrates S6 + S7 Stage 1 (shared arming) + Stage 2 (divergent
+    execution). Gated to run ONCE per day at/after S6S7_DAILY_SCAN_TIME —
+    same swing-style cadence as S5.
+    """
+    global BODYBREAK_LAST_SCAN_DATE, PULLBACK_LAST_SCAN_DATE
+
+    if not ENABLE_BODYBREAK_STRATEGY and not ENABLE_PULLBACK_STRATEGY:
+        return
+
+    now = now_ist()
+    if now.strftime('%H:%M') < S6S7_DAILY_SCAN_TIME:
+        return
+    today = now.date()
+    if BODYBREAK_LAST_SCAN_DATE == today and PULLBACK_LAST_SCAN_DATE == today:
+        return   # already ran today
+
+    BODYBREAK_LAST_SCAN_DATE = today
+    PULLBACK_LAST_SCAN_DATE = today
+
+    print(f"\n{'='*100}")
+    print(f"📈 BODY-BREAK / PULLBACK DAILY SCAN — {now.strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'='*100}")
+
+    update_bodybreak_pullback_watchlist(access_token, live_data)
+    bb_signals = check_bodybreak_entry_triggers(access_token, live_data, trader)
+    pb_signals = check_pullback_entry_triggers(access_token, live_data, trader)
+
+    print(f"BodyBreak watchlist: {len(BODYBREAK_WATCHLIST)} | signals: {len(bb_signals)}")
+    print(f"Pullback watchlist:  {len(PULLBACK_WATCHLIST)} | signals: {len(pb_signals)}")
+    print(f"{'='*100}\n")
+
+    for sig in bb_signals:
+        _log_and_place_new_reversal(sig, trader, BODYBREAK_CSV, "BODY-BREAK")
+    for sig in pb_signals:
+        _log_and_place_new_reversal(sig, trader, PULLBACK_CSV, "PULLBACK")
+
+
 def monitor_session_phase(live_data, access_token, trader=None):
     """Dispatcher: routes to the correct strategy based on current session phase.
 
@@ -13170,6 +13588,18 @@ def enhanced_monitor(access_token, keys, symbols):
                             run_sma200_daily_scan(access_token, live_data, trader)
                         except Exception as e:
                             print(f"❌ S5 (SMA200_BREAKOUT) error: {e}")
+                            if DEBUG_MODE:
+                                import traceback
+                                traceback.print_exc()
+
+                    # ── S6/S7: Body-Break + Pullback (shared Daily+1H regime) ──
+                    # Swing-style, runs ONCE per day at S6S7_DAILY_SCAN_TIME.
+                    # Isolated: a failure here must not block any other strategy.
+                    if ENABLE_BODYBREAK_STRATEGY or ENABLE_PULLBACK_STRATEGY:
+                        try:
+                            run_bodybreak_pullback_daily_scan(access_token, live_data, trader)
+                        except Exception as e:
+                            print(f"❌ S6/S7 (BODYBREAK/PULLBACK) error: {e}")
                             if DEBUG_MODE:
                                 import traceback
                                 traceback.print_exc()
