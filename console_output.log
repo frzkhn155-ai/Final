@@ -42,16 +42,16 @@ Token preview: eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOi...dQJ4ARHjAsr5PKtgLMWE
 
 🤖 HEADLESS OAUTH LOGIN
 🌐 Opening login page (headless)…
-✅ Deleted 6 Upstox emails from inbox
+✅ Deleted 3 Upstox emails from inbox
 📨 OTP requested.
 ⏳ Waiting for NEW OTP email (checking every 3 seconds, max 120s)...
-🕐 OTP requested at: 09:20:53
+🕐 OTP requested at: 09:20:12
 ⏱️ Waiting 8 seconds for email to arrive...
 📬 Found 1 unread email(s) from Upstox
 📄 Email body preview: <!DOCTYPE html><html lang='en' xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:v='urn:schemas-microsoft-com:vml' style='box-sizing: border-box;'><head style='box-sizing: border-box;'><title st...
-🎯 Pattern '(?:<b>|>)\s*(\d{6})\s*(?:</b>|<)' matched OTP: 486844
+🎯 Pattern '(?:<b>|>)\s*(\d{6})\s*(?:</b>|<)' matched OTP: 459410
 
-✅ OTP EXTRACTED: 486844
+✅ OTP EXTRACTED: 459410
    📧 From: Upstox <donotreply@transactions.upstox.com>
    📋 Subject: OTP to login
    ⏰ Received: N/A
