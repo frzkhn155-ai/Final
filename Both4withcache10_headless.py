@@ -12081,6 +12081,10 @@ def detect_fiidii_confluence_breakout(access_token, live_data, mode='fii',
     return signals
 
 
+ENABLE_JEV_GATE = os.environ.get('ENABLE_JEV_GATE', 'true').lower() == 'true'
+JEV_CONFIDENCE_THRESHOLD = float(os.environ.get('JEV_CONFIDENCE_THRESHOLD', '0.6'))
+
+
 def _log_and_place_new_reversal(signal, trader, csv_file, strategy_name):
     """Unified logger + order placer for all three new reversal strategies."""
     s   = signal['symbol']
@@ -12127,6 +12131,17 @@ def _log_and_place_new_reversal(signal, trader, csv_file, strategy_name):
     except Exception as e:
         if DEBUG_MODE:
             print(f"⚠️ CSV log error ({csv_file}): {e}")
+
+    # Jev AI decision gate (fail-open)
+    if ENABLE_JEV_GATE:
+        try:
+            from jev_client import jev_gate
+            _ok, _p = jev_gate(signal, strategy_name, JEV_CONFIDENCE_THRESHOLD)
+            print(f"🤖 Jev gate: {'FIRE' if _ok else 'BLOCK'}" + (f" (p={_p:.2f})" if _p is not None else " (no verdict)"))
+            if not _ok:
+                return
+        except Exception as e:
+            print(f"⚠️ Jev gate error (fail-open): {e}")
 
     # Place order
     if trader and is_order_time_allowed():
