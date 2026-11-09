@@ -1,7 +1,9 @@
 """Jev AI (TypeSafe System One) decision gate. Key ONLY from env TYPESAFE_AI_API_KEY.
 Fail-open: any error/missing key -> trade proceeds (gate never blocks on its own failure)."""
 import os, csv, time, json, requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 JEV_URL = os.environ.get("JEV_URL", "https://api.typesafe.ai/v1/systemone")
 JEV_MODEL = os.environ.get("JEV_MODEL", "jev-latest")
@@ -46,7 +48,7 @@ def _extract_prob(data):
 def jev_gate(signal, strategy="", threshold=0.6):
     """Return (should_fire, probability|None)."""
     key = os.environ.get("TYPESAFE_AI_API_KEY", "")
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S")
     sym, d = signal.get("symbol", ""), signal.get("direction", "")
     if not key:
         _log([ts, strategy, sym, d, "", threshold, "FIRE", "", "no key (fail-open)"])
