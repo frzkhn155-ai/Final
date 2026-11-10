@@ -181,3 +181,7 @@ Timestamp,Strategy,Symbol,Direction,Probability,Threshold,Decision,LatencyMs,Not
 2026-11-09 09:35:05,BODY-BREAK,GAIL,CE,,0.6,FIRE,,no key (fail-open)
 2026-11-09 09:35:05,BODY-BREAK,GLENMARK,CE,,0.6,FIRE,,no key (fail-open)
 2026-11-09 09:35:05,PULLBACK,MAHABANK,CE,,0.6,FIRE,,no key (fail-open)
+2026-11-10 09:20:37,MTF MOMENTUM,MPHASIS,PE,,0.6,FIRE,,no key (fail-open)
+2026-11-10 09:20:37,MTF MOMENTUM,DATAPATTNS,CE,,0.6,FIRE,,no key (fail-open)
+2026-11-10 09:20:37,MTF MOMENTUM,DABUR,PE,,0.6,FIRE,,no key (fail-open)
+2026-11-10 09:21:31,FII/DII BB CONTINUATION,VEDL,CE,,0.6,FIRE,,no key (fail-open)
