@@ -1,0 +1,38 @@
+name: LuxAlgo NIFTY (paper)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'paper (default, no real orders) or live'
+        required: false
+        default: 'paper'
+
+permissions:
+  contents: write
+
+jobs:
+  luxalgo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 400
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - name: Run LuxAlgo NIFTY engine
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          LUXALGO_MODE: ${{ github.event.inputs.mode }}
+          TZ: Asia/Kolkata
+        run: python -u luxalgo_nifty.py 2>&1 | tee luxalgo_console.log
+      - name: Commit results
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add luxalgo_trades.csv luxalgo_live_production.log luxalgo_console.log 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "luxalgo: session results $(TZ=Asia/Kolkata date +%F)"
+          git pull --rebase -q || true
+          git push || true
