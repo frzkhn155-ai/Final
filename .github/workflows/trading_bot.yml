@@ -207,6 +207,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          set +e
           if [ -z "$GH_TOKEN" ]; then
             echo "⚠️  GH_PAT not set — skipping cross-repo token sync."
             exit 0
@@ -219,11 +220,16 @@ jobs:
             echo "⚠️  upstox_token.txt is empty — nothing to sync."
             exit 0
           fi
-          echo "✅ Syncing token"
-          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/Final
-          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/Final-ORB-Only
-          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/luxalgo-upstox-multi-tf
-          echo "✅ Synced"
+          echo "🔄 Syncing UPSTOX_TOKEN to sibling repos..."
+          # Per-repo: one failure must not block the others.
+          # Dropped Final-ORB-Only (repo 404). Added both LuxAlgo bots.
+          for REPO in Final luxalgo-upstox-multi-tf luxalgo-upstox-nifty-bot; do
+            if gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo "frzkhn155-ai/$REPO"; then
+              echo "✅ Token synced to frzkhn155-ai/$REPO"
+            else
+              echo "⚠️ Token sync to frzkhn155-ai/$REPO failed"
+            fi
+          done
 
       - name: Save Upstox token (post-run)
         if: always() && steps.precheck.outputs.should_run == 'true'
