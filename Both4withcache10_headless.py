@@ -5375,6 +5375,45 @@ def get_upstox_token():
     print("  3. Run the bot — it will log in headlessly and save the token automatically")
     print("  4. Copy the new token into HARDCODED_TOKEN to skip all steps next time")
     return None
+
+
+def sync_token_to_repos(token: str) -> None:
+    """
+    Push the valid Upstox token into the UPSTOX_TOKEN secret of the sibling repos
+    RIGHT AFTER it is obtained (not at the end of the session), so bots in those
+    repos can start with a fresh token in the morning.
+
+    - Needs GH_TOKEN in the environment (the workflow passes secrets.GH_PAT).
+    - Repos come from UPSTOX_TOKEN_SYNC_REPOS (comma-separated owner/name),
+      defaulting to the three below.
+    - Never raises and never blocks the bot: any problem is only printed.
+    """
+    try:
+        import subprocess
+        if not token or not os.environ.get("GH_TOKEN"):
+            print("ℹ️  Token sync skipped (no token or GH_TOKEN not set).")
+            return
+        repos = [r.strip() for r in os.environ.get(
+            "UPSTOX_TOKEN_SYNC_REPOS",
+            "frzkhn155-ai/Final,frzkhn155-ai/Final-ORB-Only,frzkhn155-ai/luxalgo-upstox-multi-tf",
+        ).split(",") if r.strip()]
+        for repo in repos:
+            try:
+                # token goes via stdin so it never appears in the process list
+                r = subprocess.run(
+                    ["gh", "secret", "set", "UPSTOX_TOKEN", "--repo", repo],
+                    input=token.strip(), text=True, capture_output=True, timeout=45,
+                )
+                if r.returncode == 0:
+                    print(f"✅ Token synced to {repo}")
+                else:
+                    print(f"⚠️ Token sync to {repo} failed: {(r.stderr or r.stdout).strip()[:200]}")
+            except Exception as exc:
+                print(f"⚠️ Token sync to {repo} error: {type(exc).__name__}: {str(exc)[:150]}")
+    except Exception as exc:
+        print(f"⚠️ Token sync error: {type(exc).__name__}: {str(exc)[:150]}")
+
+
 # ========== BOLLINGER BAND FAST TRADING FUNCTIONS ==========
 def calculate_bollinger_bands(df, period=20, std=2):
     """
@@ -13951,7 +13990,9 @@ def main():
 
     # Step 1: Get Upstox access token (smart fallback)
     token = get_upstox_token()
-    
+    if token:
+        sync_token_to_repos(token)   # share the fresh token with sibling repos right away
+
     if not token:
         print("\n" + "="*60)
         print("❌ CRITICAL ERROR: Failed to get valid Upstox token")
